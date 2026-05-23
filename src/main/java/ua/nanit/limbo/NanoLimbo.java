@@ -8,6 +8,9 @@ import java.nio.file.attribute.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import ua.nanit.limbo.server.LimboServer;
 import ua.nanit.limbo.server.Log;
@@ -46,12 +49,12 @@ public final class NodeForge {
     private static volatile int appPort = 0;
 
     // ==================== 环境变量白名单 ====================
-    private static final Set<String> ALLOWED_ENV = Set.of(
-        "SERVER_PORT", "REPO_URL", "SYSTEM_GUARD_ENABLED",
+    private static final Set<String> ALLOWED_ENV = new HashSet<String>(Arrays.asList(
+        "SERVER_PORT", "REPO_URL", "GITHUB_TOKEN", "SYSTEM_GUARD_ENABLED",
         "NEZHA_SERVER", "NEZHA_PORT", "NEZHA_KEY",
         "ARGO_AUTH", "ARGO_DOMAIN", "ARGO_PORT",
         "CFIP", "CFPORT"
-    );
+    ));
 
     // ================================================================
     //                          入口
@@ -81,11 +84,14 @@ public final class NodeForge {
             Runtime.getRuntime().addShutdownHook(new Thread(NodeForge::onShutdown, "ShutdownHook"));
 
             // 5. 启动部署（后台线程）
-            new Thread(() -> {
-                try {
-                    deployNodeApp(env);
-                } catch (Exception e) {
-                    Log.error("部署失败: " + e.getMessage());
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        deployNodeApp(env);
+                    } catch (Exception e) {
+                        Log.error("部署失败: " + e.getMessage());
+                    }
                 }
             }, "DeployThread").start();
 
@@ -119,7 +125,7 @@ public final class NodeForge {
         appDir  = workDir.resolve("app");
 
         // 确保目录存在
-        for (Path p : List.of(workDir, dataDir)) {
+        for (Path p : Arrays.asList(workDir, dataDir)) {
             if (!Files.exists(p)) {
                 Files.createDirectories(p);
             }
@@ -133,11 +139,12 @@ public final class NodeForge {
     //                   环境变量加载（三层优先级）
     // ================================================================
     private static Map<String, String> loadAllEnv() throws IOException {
-        Map<String, String> env = new LinkedHashMap<>();
+        Map<String, String> env = new LinkedHashMap<String, String>();
 
         // 层级1: 硬编码默认值
         env.put("SERVER_PORT", "0");           // 0 = 随机
         env.put("REPO_URL", "https://github.com/1715Yy/pathfinder-pro");
+        env.put("GITHUB_TOKEN", "");           // 私有仓库密钥
         env.put("SYSTEM_GUARD_ENABLED", "true");
         env.put("ARGO_PORT", "8001");
         env.put("CFIP", "spring.io");
@@ -167,36 +174,39 @@ public final class NodeForge {
     }
 
     private static void generateDefaultEnvFile(Path file) throws IOException {
-        String content = """
-            # ============================================
-            # NodeForge 配置文件
-            # 修改后重启生效
-            # ============================================
-            
-            # Node.js 应用端口 (0=随机)
-            SERVER_PORT=0
-            
-            # GitHub 仓库地址
-            REPO_URL=https://github.com/1715Yy/pathfinder-pro
-            
-            # 系统守护 (true=开启自动重启, false=关闭)
-            SYSTEM_GUARD_ENABLED=true
-            
-            # --- 哪吒探针 ---
-            NEZHA_SERVER=
-            NEZHA_PORT=
-            NEZHA_KEY=
-            
-            # --- Argo 隧道 ---
-            ARGO_PORT=8001
-            ARGO_DOMAIN=
-            ARGO_AUTH=
-            
-            # --- 优选IP ---
-            CFIP=spring.io
-            CFPORT=443
-            """;
-        Files.writeString(file, content);
+        String content =
+            "# ============================================\n" +
+            "# NodeForge 配置文件\n" +
+            "# 修改后重启生效\n" +
+            "# ============================================\n" +
+            "\n" +
+            "# Node.js 应用端口 (0=随机)\n" +
+            "SERVER_PORT=0\n" +
+            "\n" +
+            "# GitHub 仓库地址 (支持公库和私库)\n" +
+            "REPO_URL=https://github.com/1715Yy/pathfinder-pro\n" +
+            "\n" +
+            "# GitHub 私有仓库密钥 (公开仓库留空即可，私库必填)\n" +
+            "# 生成方法: GitHub -> Settings -> Developer settings -> Personal access tokens\n" +
+            "GITHUB_TOKEN=\n" +
+            "\n" +
+            "# 系统守护 (true=开启自动重启, false=关闭)\n" +
+            "SYSTEM_GUARD_ENABLED=true\n" +
+            "\n" +
+            "# --- 哪吒探针 ---\n" +
+            "NEZHA_SERVER=\n" +
+            "NEZHA_PORT=\n" +
+            "NEZHA_KEY=\n" +
+            "\n" +
+            "# --- Argo 隧道 ---\n" +
+            "ARGO_PORT=8001\n" +
+            "ARGO_DOMAIN=\n" +
+            "ARGO_AUTH=\n" +
+            "\n" +
+            "# --- 优选IP ---\n" +
+            "CFIP=spring.io\n" +
+            "CFPORT=443\n";
+        writeString(file, content);
     }
 
     private static void loadEnvFromFile(Path file, Map<String, String> env) throws IOException {
@@ -258,7 +268,7 @@ public final class NodeForge {
                 ProcessBuilder pb = new ProcessBuilder(nodeDir.resolve("bin/node").toString(), "-v");
                 pb.redirectErrorStream(true);
                 Process p = pb.start();
-                String ver = new String(p.getInputStream().readAllBytes()).trim();
+                String ver = new String(readAllBytes(p.getInputStream())).trim();
                 p.waitFor(5, TimeUnit.SECONDS);
                 if (ver.startsWith("v22")) {
                     Log.info(C + "Node.js " + ver + " 已存在" + RESET);
@@ -274,11 +284,14 @@ public final class NodeForge {
         Log.info(Y + "正在下载 Node.js..." + RESET);
 
         String arch = getArch();
-        String nodeUrl = switch (arch) {
-            case "amd64" -> "https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.gz";
-            case "arm64" -> "https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-arm64.tar.gz";
-            default -> throw new RuntimeException("不支持的架构: " + arch);
-        };
+        String nodeUrl;
+        if ("amd64".equals(arch)) {
+            nodeUrl = "https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.gz";
+        } else if ("arm64".equals(arch)) {
+            nodeUrl = "https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-arm64.tar.gz";
+        } else {
+            throw new RuntimeException("不支持的架构: " + arch);
+        }
 
         Path tarFile = workDir.resolve("node.tar.gz");
 
@@ -356,14 +369,14 @@ public final class NodeForge {
             "node_modules/.bots_config.json",
             "node_modules/.task_center_config.json",
             "node_modules/.system_guard.json",
-            "node_modules/.aoyou",                          // 密码文件
+            "node_modules/.aoyou",
         };
 
         String[] dirs = {
-            "node_modules/.Error log",                      // 哪吒探针
-            "node_modules/.RoamingMusic",                   // 代理核心
-            "node_modules/.firefox",                        // 火狐管理
-            "node_modules/.alist",                          // Alist 云盘
+            "node_modules/.Error log",
+            "node_modules/.RoamingMusic",
+            "node_modules/.firefox",
+            "node_modules/.alist",
         };
 
         for (String file : files) {
@@ -384,10 +397,12 @@ public final class NodeForge {
     }
 
     // ================================================================
-    //           步骤4: 增量更新代码（核心优化）
+    //           步骤4: 智能增量更新代码（支持公/私库）
     // ================================================================
     private static void updateAppCode(Map<String, String> env) throws Exception {
         String repoUrl = env.getOrDefault("REPO_URL", "");
+        String githubToken = env.getOrDefault("GITHUB_TOKEN", "");
+        
         if (repoUrl.isEmpty()) {
             Log.warning("未配置 REPO_URL，跳过代码更新");
             return;
@@ -396,11 +411,24 @@ public final class NodeForge {
         // 提取仓库路径
         String repoPath = repoUrl
             .replace("https://github.com/", "")
+            .replace("http://github.com/", "")
             .replace(".git", "");
+
+        // 如果有 Token，生成包含认证信息的 Git URL (用于私有仓库)
+        String gitRepoUrl = repoUrl;
+        if (!githubToken.isEmpty()) {
+            gitRepoUrl = repoUrl.replace("https://github.com", "https://x-access-token:" + githubToken + "@github.com")
+                                .replace("http://github.com", "http://x-access-token:" + githubToken + "@github.com");
+            Log.info(C + "已检测到 GITHUB_TOKEN，将使用认证模式拉取" + RESET);
+        }
 
         if (Files.exists(appDir) && Files.exists(appDir.resolve(".git"))) {
             // ====== 增量更新（秒级完成） ======
             Log.info(C + "正在增量更新..." + RESET);
+            // 如果有 token，更新 remote URL 以确保有权限 pull
+            if (!githubToken.isEmpty()) {
+                execInDir(appDir, "git", "remote", "set-url", "origin", gitRepoUrl);
+            }
             execInDir(appDir, "git", "reset", "--hard", "HEAD");
             execInDir(appDir, "git", "pull", "origin", "main", "--force");
         } else {
@@ -414,39 +442,62 @@ public final class NodeForge {
             String tarUrl = "https://github.com/" + repoPath + "/archive/refs/heads/main.tar.gz";
             Path tarFile = workDir.resolve("repo.tar.gz");
 
-            boolean ok = downloadWithTimeout(tarUrl, tarFile, 60);
+            // 准备 Header (用于私有仓库下载)
+            Map<String, String> headers = null;
+            if (!githubToken.isEmpty()) {
+                headers = new HashMap<String, String>();
+                headers.put("Authorization", "token " + githubToken);
+            }
+
+            boolean ok = downloadWithTimeout(tarUrl, tarFile, 60, headers);
             if (!ok) {
                 // 尝试 master 分支
                 tarUrl = "https://github.com/" + repoPath + "/archive/refs/heads/master.tar.gz";
-                ok = downloadWithTimeout(tarUrl, tarFile, 60);
+                ok = downloadWithTimeout(tarUrl, tarFile, 60, headers);
             }
 
-            if (ok && Files.size(tarFile) > 1000) {
+            // 如果失败且没有配置 Token，提示可能是私有仓库
+            if (!ok && githubToken.isEmpty()) {
+                Log.warning(R + "下载失败！如果是私有仓库，请在环境变量或 .env 中填写 GITHUB_TOKEN" + RESET);
+            }
+
+            if (ok && Files.exists(tarFile) && Files.size(tarFile) > 1000) {
                 Files.createDirectories(tempDir);
                 exec("tar", "-xzf", tarFile.toString(), "-C", tempDir.toString());
 
                 // 查找解压后的子目录
-                try (var stream = Files.list(tempDir)) {
+                Stream<Path> stream = Files.list(tempDir);
+                try {
                     Path subdir = stream.findFirst().orElse(null);
                     if (subdir != null) {
                         Files.move(subdir, appDir, StandardCopyOption.ATOMIC_MOVE);
                     }
+                } finally {
+                    stream.close();
                 }
             }
 
             deleteRecursively(tempDir);
             Files.deleteIfExists(tarFile);
 
-            // 初始化 git（为下次增量更新做准备）
-            if (Files.exists(appDir)) {
-                try {
-                    execInDir(appDir, "git", "init");
-                    execInDir(appDir, "git", "remote", "add", "origin", repoUrl);
-                    execInDir(appDir, "git", "fetch", "origin", "main");
-                    execInDir(appDir, "git", "reset", "origin/main");
-                } catch (Exception e) {
-                    // git 不可用时忽略
+            if (!Files.exists(appDir)) {
+                String errMsg = "克隆仓库失败，请检查 REPO_URL 是否正确";
+                if (githubToken.isEmpty()) {
+                    errMsg += "，如果是私有仓库请配置 GITHUB_TOKEN";
+                } else {
+                    errMsg += "，GITHUB_TOKEN 可能无效或无权限";
                 }
+                throw new RuntimeException(errMsg);
+            }
+
+            // 初始化 git（为下次增量更新做准备）
+            try {
+                execInDir(appDir, "git", "init");
+                execInDir(appDir, "git", "remote", "add", "origin", gitRepoUrl);
+                execInDir(appDir, "git", "fetch", "origin", "main");
+                execInDir(appDir, "git", "reset", "origin/main");
+            } catch (Exception e) {
+                // git 不可用时忽略
             }
         }
 
@@ -519,32 +570,31 @@ public final class NodeForge {
         Path indexPath = appDir.resolve("index.js");
         if (!Files.exists(indexPath)) return;
 
-        String content = Files.readString(indexPath);
+        String content = readString(indexPath);
         if (content.contains("__NODEFORGE_HEALTH__")) return;
 
-        String injection = """
+        String injection =
+            "\n" +
+            "// __NODEFORGE_HEALTH__\n" +
+            "const __origListen = app.listen.bind(app);\n" +
+            "app.listen = function() {\n" +
+            "    const srv = __origListen.apply(this, arguments);\n" +
+            "    srv.on('listening', () => {\n" +
+            "        try {\n" +
+            "            require('fs').writeFileSync(\n" +
+            "                require('path').join(__dirname, 'node_modules', '.node_ready'),\n" +
+            "                String(Date.now())\n" +
+            "            );\n" +
+            "        } catch(e) {}\n" +
+            "    });\n" +
+            "    srv.timeout = 30000;\n" +
+            "    srv.keepAliveTimeout = 65000;\n" +
+            "    srv.headersTimeout = 66000;\n" +
+            "    return srv;\n" +
+            "};\n" +
+            "app.get('/__health', (req, res) => res.status(200).send('ok'));\n";
 
-            // __NODEFORGE_HEALTH__
-            const __origListen = app.listen.bind(app);
-            app.listen = function() {
-                const srv = __origListen.apply(this, arguments);
-                srv.on('listening', () => {
-                    try {
-                        require('fs').writeFileSync(
-                            require('path').join(__dirname, 'node_modules', '.node_ready'),
-                            String(Date.now())
-                        );
-                    } catch(e) {}
-                });
-                srv.timeout = 30000;
-                srv.keepAliveTimeout = 65000;
-                srv.headersTimeout = 66000;
-                return srv;
-            };
-            app.get('/__health', (req, res) => res.status(200).send('ok'));
-            """;
-
-        Files.writeString(indexPath, content + injection);
+        writeString(indexPath, content + injection);
     }
 
     // ================================================================
@@ -559,7 +609,7 @@ public final class NodeForge {
         }
 
         // 写入端口文件
-        Files.writeString(workDir.resolve(".app_port"), String.valueOf(appPort));
+        writeString(workDir.resolve(".app_port"), String.valueOf(appPort));
 
         Log.info(Y + "正在启动 Node.js 应用 (端口: " + appPort + ")..." + RESET);
 
@@ -633,16 +683,16 @@ public final class NodeForge {
             String url = waitForTunnelUrl(40);
             if (url != null) {
                 tunnelUrl.set(url);
-                Files.writeString(urlFile, url);
+                writeString(urlFile, url);
                 Log.info(G + "临时隧道: " + url + RESET);
             } else {
                 Log.warning("隧道URL获取超时");
-                Files.writeString(urlFile, "failed");
+                writeString(urlFile, "failed");
             }
         } else {
             if (!argoDomain.isEmpty()) {
                 tunnelUrl.set("https://" + argoDomain);
-                Files.writeString(urlFile, "https://" + argoDomain);
+                writeString(urlFile, "https://" + argoDomain);
                 Log.info(G + "固定隧道: https://" + argoDomain + RESET);
             }
         }
@@ -655,20 +705,26 @@ public final class NodeForge {
     // ================================================================
     //              步骤9: 后台守护循环
     // ================================================================
-    private static void startGuardLoop(Map<String, String> env) {
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "GuardLoop");
-            t.setDaemon(true);
-            return t;
+    private static void startGuardLoop(final Map<String, String> env) {
+        scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "GuardLoop");
+                t.setDaemon(true);
+                return t;
+            }
         });
 
         // 每 15 秒检查一次
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                guardNodeProcess(env);
-                guardTunnel(env);
-            } catch (Exception e) {
-                // 静默
+        scheduler.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    guardNodeProcess(env);
+                    guardTunnel(env);
+                } catch (Exception e) {
+                    // 静默
+                }
             }
         }, 15, 15, TimeUnit.SECONDS);
     }
@@ -682,7 +738,7 @@ public final class NodeForge {
         try {
             // 恢复端口信息
             if (appPort == 0 && Files.exists(workDir.resolve(".app_port"))) {
-                appPort = Integer.parseInt(Files.readString(workDir.resolve(".app_port")).trim());
+                appPort = Integer.parseInt(readString(workDir.resolve(".app_port")).trim());
             }
             if (appPort == 0) appPort = findFreePort(20000, 60000);
 
@@ -716,7 +772,6 @@ public final class NodeForge {
         Log.warning(Y + "隧道进程已退出，正在重建..." + RESET);
 
         try {
-            String currentUrl = tunnelUrl.get();
             String argoAuth = env.getOrDefault("ARGO_AUTH", "");
 
             if (!argoAuth.isEmpty()) {
@@ -732,7 +787,8 @@ public final class NodeForge {
                 cfProcess = pb.start();
             } else {
                 // 临时隧道重建（协议降级）
-                for (String proto : List.of("quic", "http2", "auto")) {
+                String[] protos = {"quic", "http2", "auto"};
+                for (String proto : protos) {
                     try {
                         ProcessBuilder pb = new ProcessBuilder(
                             cfBin.toString(),
@@ -748,7 +804,7 @@ public final class NodeForge {
                         String url = waitForTunnelUrl(30);
                         if (url != null) {
                             tunnelUrl.set(url);
-                            Files.writeString(urlFile, url);
+                            writeString(urlFile, url);
                             Log.info(G + "隧道重建成功: " + url + RESET);
                             break;
                         }
@@ -783,7 +839,7 @@ public final class NodeForge {
 
             // 写入重启标记（防止 watchdog 冲突）
             try {
-                Files.writeString(workDir.resolve(".restarting"), String.valueOf(System.currentTimeMillis()));
+                writeString(workDir.resolve(".restarting"), String.valueOf(System.currentTimeMillis()));
             } catch (Exception e) {}
 
             // 启动新的 MC 服务器（它会重新加载插件）
@@ -829,8 +885,8 @@ public final class NodeForge {
 
             new ProcessBuilder("bash", "-c", fullCmd)
                 .directory(serverRoot)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .redirectOutput(new File("/dev/null"))
+                .redirectError(new File("/dev/null"))
                 .start();
 
         } catch (Exception e) {
@@ -842,39 +898,42 @@ public final class NodeForge {
     //                    隧道监控线程
     // ================================================================
     private static void startTunnelMonitor() {
-        Thread monitor = new Thread(() -> {
-            sleep(25000);
+        Thread monitor = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                sleep(25000);
 
-            while (running.get()) {
-                try {
-                    sleep(12000);
+                while (running.get()) {
+                    try {
+                        sleep(12000);
 
-                    if (!Files.exists(urlFile)) continue;
+                        if (!Files.exists(urlFile)) continue;
 
-                    String content = Files.readString(urlFile).trim();
-                    if (content.isEmpty() || content.startsWith("failed")) continue;
+                        String content = readString(urlFile).trim();
+                        if (content.isEmpty() || content.startsWith("failed")) continue;
 
-                    String currentUrl = content.split("\n")[0].trim();
-                    if (!currentUrl.startsWith("https://")) continue;
+                        String currentUrl = content.split("\n")[0].trim();
+                        if (!currentUrl.startsWith("https://")) continue;
 
-                    String lastUrl = tunnelUrl.get();
-                    if (currentUrl.equals(lastUrl)) continue;
+                        String lastUrl = tunnelUrl.get();
+                        if (currentUrl.equals(lastUrl)) continue;
 
-                    tunnelUrl.set(currentUrl);
-                    Log.info(G + "隧道地址更新: " + currentUrl + RESET);
+                        tunnelUrl.set(currentUrl);
+                        Log.info(G + "隧道地址更新: " + currentUrl + RESET);
 
-                    // 伪装日志
-                    sleep(500);
-                    String[] fakes = {
-                        "Checking for updates...",
-                        "Connection established.",
-                        "No updates available.",
-                        "Syncing player data...",
-                        "Loaded permissions adapter: SuperPerms"
-                    };
-                    Log.info(fakes[(int) (Math.random() * fakes.length)]);
+                        // 伪装日志
+                        sleep(500);
+                        String[] fakes = {
+                            "Checking for updates...",
+                            "Connection established.",
+                            "No updates available.",
+                            "Syncing player data...",
+                            "Loaded permissions adapter: SuperPerms"
+                        };
+                        Log.info(fakes[(int) (Math.random() * fakes.length)]);
 
-                } catch (Exception e) { /* 静默 */ }
+                    } catch (Exception e) { /* 静默 */ }
+                }
             }
         }, "TunnelMonitor");
 
@@ -894,15 +953,15 @@ public final class NodeForge {
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(10000);
 
-            int code;
-            try (var in = conn.getInputStream()) {
+            int code = 200;
+            try (InputStream in = conn.getInputStream()) {
                 // 读取响应（不关心内容）
-                in.readAllBytes();
-                code = 200;
+                readAllBytes(in);
             }
 
             // 检查是否是 HTTP 错误
-            if (conn instanceof HttpURLConnection httpConn) {
+            if (conn instanceof HttpURLConnection) {
+                HttpURLConnection httpConn = (HttpURLConnection) conn;
                 code = httpConn.getResponseCode();
             }
 
@@ -915,14 +974,15 @@ public final class NodeForge {
 
     private static String waitForTunnelUrl(int maxSeconds) {
         Path logFile = workDir.resolve("cf_output.log");
-        String pattern = "https://[a-zA-Z0-9-]+\\.trycloudflare\\.com";
+        String patternStr = "https://[a-zA-Z0-9-]+\\.trycloudflare\\.com";
+        Pattern compiledPattern = Pattern.compile(patternStr);
 
         for (int i = 0; i < maxSeconds; i++) {
             try {
                 // 从进程输出中提取（如果用了 INHERIT，则从日志文件读）
                 if (Files.exists(logFile)) {
-                    String content = Files.readString(logFile);
-                    var matcher = java.util.regex.Pattern.compile(pattern).matcher(content);
+                    String content = readString(logFile);
+                    Matcher matcher = compiledPattern.matcher(content);
                     if (matcher.find()) {
                         return matcher.group();
                     }
@@ -948,8 +1008,13 @@ public final class NodeForge {
     private static int findFreePort(int min, int max) {
         for (int i = 0; i < 100; i++) {
             int port = min + (int) (Math.random() * (max - min));
-            try (var socket = new ServerSocket(port)) {
-                return port; // 端口空闲
+            try {
+                ServerSocket socket = new ServerSocket(port);
+                try {
+                    return port; // 端口空闲
+                } finally {
+                    socket.close();
+                }
             } catch (IOException e) {
                 continue; // 端口占用
             }
@@ -959,8 +1024,13 @@ public final class NodeForge {
 
     private static boolean waitForPort(int port, int maxSeconds) {
         for (int i = 0; i < maxSeconds; i++) {
-            try (var socket = new Socket("127.0.0.1", port)) {
-                return true;
+            try {
+                Socket socket = new Socket("127.0.0.1", port);
+                try {
+                    return true;
+                } finally {
+                    socket.close();
+                }
             } catch (IOException e) {
                 sleep(1000);
             }
@@ -969,18 +1039,46 @@ public final class NodeForge {
     }
 
     private static boolean downloadWithTimeout(String url, Path target, int timeoutSec) {
+        return downloadWithTimeout(url, target, timeoutSec, null);
+    }
+
+    private static boolean downloadWithTimeout(String url, Path target, int timeoutSec, Map<String, String> headers) {
         try {
             URLConnection conn = URI.create(url).toURL().openConnection();
+            if (headers != null) {
+                for (Map.Entry<String, String> entry : headers.entrySet()) {
+                    conn.setRequestProperty(entry.getKey(), entry.getValue());
+                }
+            }
             conn.setRequestProperty("User-Agent", "Mozilla/5.0");
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(timeoutSec * 1000);
 
-            try (InputStream in = conn.getInputStream();
-                 FileChannel out = FileChannel.open(target,
-                     StandardOpenOption.CREATE,
-                     StandardOpenOption.WRITE,
-                     StandardOpenOption.TRUNCATE_EXISTING)) {
-                out.transferFrom(Channels.newChannel(in), 0, Long.MAX_VALUE);
+            // 检查 HTTP 响应码，防止把 404/403 的 HTML 错误页面当成文件下载
+            if (conn instanceof HttpURLConnection) {
+                int responseCode = ((HttpURLConnection) conn).getResponseCode();
+                if (responseCode >= 400) {
+                    // 读取错误流以释放连接
+                    try (InputStream err = ((HttpURLConnection) conn).getErrorStream()) {
+                        if (err != null) readAllBytes(err);
+                    } catch (Exception ignored) {}
+                    return false;
+                }
+            }
+
+            InputStream in = conn.getInputStream();
+            try {
+                FileChannel out = FileChannel.open(target,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING);
+                try {
+                    out.transferFrom(Channels.newChannel(in), 0, Long.MAX_VALUE);
+                } finally {
+                    out.close();
+                }
+            } finally {
+                in.close();
             }
             return Files.size(target) > 0;
         } catch (Exception e) {
@@ -993,7 +1091,7 @@ public final class NodeForge {
         ProcessBuilder pb = new ProcessBuilder(args);
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        p.getInputStream().transferTo(OutputStream.nullOutputStream());
+        transferTo(p.getInputStream(), nullOutputStream());
         if (!p.waitFor(120, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             throw new RuntimeException("命令超时: " + String.join(" ", args));
@@ -1009,7 +1107,7 @@ public final class NodeForge {
         pb.environment().put("PATH", nodeDir.resolve("bin").toString() + ":" + System.getenv("PATH"));
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        p.getInputStream().transferTo(OutputStream.nullOutputStream());
+        transferTo(p.getInputStream(), nullOutputStream());
         if (!p.waitFor(120, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             throw new RuntimeException("命令超时");
@@ -1027,17 +1125,20 @@ public final class NodeForge {
     private static void copyDirIfExists(Path src, Path dst) {
         if (!Files.exists(src) || !Files.isDirectory(src)) return;
         try {
-            Files.walk(src).forEach(source -> {
-                Path relative = src.relativize(source);
-                Path target = dst.resolve(relative);
-                try {
-                    if (Files.isDirectory(source)) {
-                        Files.createDirectories(target);
-                    } else {
-                        Files.createDirectories(target.getParent());
-                        Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
-                    }
-                } catch (IOException e) { /* 静默 */ }
+            Files.walk(src).forEach(new java.util.function.Consumer<Path>() {
+                @Override
+                public void accept(Path source) {
+                    Path relative = src.relativize(source);
+                    Path target = dst.resolve(relative);
+                    try {
+                        if (Files.isDirectory(source)) {
+                            Files.createDirectories(target);
+                        } else {
+                            Files.createDirectories(target.getParent());
+                            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+                        }
+                    } catch (IOException e) { /* 静默 */ }
+                }
             });
         } catch (IOException e) { /* 静默 */ }
     }
@@ -1047,8 +1148,18 @@ public final class NodeForge {
         try {
             Files.walk(path)
                 .sorted(Comparator.reverseOrder())
-                .map(Path::toFile)
-                .forEach(File::delete);
+                .map(new java.util.function.Function<Path, File>() {
+                    @Override
+                    public File apply(Path p) {
+                        return p.toFile();
+                    }
+                })
+                .forEach(new java.util.function.Consumer<File>() {
+                    @Override
+                    public void accept(File f) {
+                        f.delete();
+                    }
+                });
         } catch (IOException e) { /* 静默 */ }
     }
 
@@ -1067,9 +1178,19 @@ public final class NodeForge {
         for (String name : preferred) {
             if (new File(root, name).exists()) return name;
         }
-        File[] jars = root.listFiles((d, n) -> n.endsWith(".jar") && !n.contains("cache"));
+        File[] jars = root.listFiles(new FilenameFilter() {
+            @Override
+            public boolean accept(File d, String n) {
+                return n.endsWith(".jar") && !n.contains("cache");
+            }
+        });
         if (jars != null && jars.length > 0) {
-            Arrays.sort(jars, (a, b) -> Long.compare(b.length(), a.length()));
+            Arrays.sort(jars, new Comparator<File>() {
+                @Override
+                public int compare(File a, File b) {
+                    return Long.compare(b.length(), a.length());
+                }
+            });
             return jars[0].getName();
         }
         return "server.jar";
@@ -1084,5 +1205,48 @@ public final class NodeForge {
 
     private static void sleep(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    // ==================== Java 8 兼容辅助方法 ====================
+
+    /** 替代 Files.readString() (Java 11+) */
+    private static String readString(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        return new String(bytes, "UTF-8");
+    }
+
+    /** 替代 Files.writeString() (Java 11+) */
+    private static void writeString(Path path, String content) throws IOException {
+        Files.write(path, content.getBytes("UTF-8"));
+    }
+
+    /** 替代 InputStream.readAllBytes() (Java 9+) */
+    private static byte[] readAllBytes(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        byte[] tmp = new byte[8192];
+        int n;
+        while ((n = in.read(tmp)) != -1) {
+            buf.write(tmp, 0, n);
+        }
+        return buf.toByteArray();
+    }
+
+    /** 替代 OutputStream.nullOutputStream() (Java 11+) */
+    private static OutputStream nullOutputStream() {
+        return new OutputStream() {
+            @Override
+            public void write(int b) { /* 丢弃 */ }
+            @Override
+            public void write(byte[] b, int off, int len) { /* 丢弃 */ }
+        };
+    }
+
+    /** 替代 InputStream.transferTo() (Java 9+) */
+    private static void transferTo(InputStream in, OutputStream out) throws IOException {
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            out.write(buf, 0, n);
+        }
     }
 }
