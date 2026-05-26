@@ -101,7 +101,7 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
-    // ★ 1. 强制修改 Limbo 配置文件
+    // ★ 1. 强制重写完整的 Limbo 配置文件
     autoFixLimboConfig();
 
     if (NODE_ENABLED) {
@@ -152,7 +152,7 @@ public static void main(String[] args) {
         new LimboServer().start();
     } catch (Exception e) {
         System.err.println("FATAL: Cannot start Limbo server!");
-        e.printStackTrace(); // ★ 打印完整错误堆栈，方便排查
+        e.printStackTrace();
     }
     
     // ★ 防止 Limbo 意外崩溃导致 JVM 退出，从而杀死后台的 Node 进程
@@ -161,71 +161,38 @@ public static void main(String[] args) {
 }
 
 // ============================================================
-// 强制修改 Limbo 配置 (修复 NPE: 加入 player-info 配置)
+// 强制重写 Limbo 配置 (彻底解决 NPE 和配置丢失问题)
 // ============================================================
 
 private static void autoFixLimboConfig() {
     try {
         Path configFile = Paths.get("settings.yml");
-        String content = "";
         String serverPort = env("SERVER_PORT", "25565"); // ★ 读取面板分配的端口
 
-        if (Files.exists(configFile)) {
-            content = Files.readString(configFile);
-            // 强制修改在线模式和超时
-            content = replaceYamlValue(content, "online-mode", "false");
-            content = replaceYamlValue(content, "player-idle-timeout", "0");
-            // 强制修改绑定端口，防止与 Node 冲突
-            if (content.contains("port:")) {
-                content = content.replaceAll("port:\\s*\\d+", "port: " + serverPort);
-            } else if (content.contains("bind:")) {
-                content = content.replace("bind:", "bind:\n    port: " + serverPort);
-            }
-            
-            // ★ 核心修复: 确保 player-info 节点存在，防止 PacketPlayerInfo 抛出 NullPointerException
-            if (!content.contains("player-info:")) {
-                content += "\nplayer-info:\n  username: \"LimboPlayer\"\n  display-name: \"&eLimboPlayer\"\n  property: []\n";
-            } else {
-                if (!content.contains("display-name:")) {
-                    content = content.replace("player-info:", "player-info:\n  display-name: \"&eLimboPlayer\"");
-                }
-                if (!content.contains("username:")) {
-                    content = content.replace("player-info:", "player-info:\n  username: \"LimboPlayer\"");
-                }
-            }
-        } else {
-            // ★ 如果文件不存在，生成完整的 NanoLimbo 标准配置
-            content = "bind:\n" +
-                      "  host: 0.0.0.0\n" +
-                      "  port: " + serverPort + "\n" +
-                      "limbo:\n" +
-                      "  dimension: overworld\n" +
-                      "  gamemode: adventure\n" +
-                      "  max-players: 20\n" +
-                      "  player-idle-timeout: 0\n" +
-                      "  player-info:\n" +
-                      "    username: \"LimboPlayer\"\n" +
-                      "    display-name: \"&eLimboPlayer\"\n" +
-                      "    property: []\n" +
-                      "online-mode: false\n" +
-                      "forward-mode: none\n" +
-                      "ping:\n" +
-                      "  description: \"A NanoLimbo server\"\n" +
-                      "  version: \"1.20.x\"\n" +
-                      "  max-players: 20\n";
-        }
+        // ★ 极致修复：直接删除可能损坏或残缺的旧配置，强制写入标准完整配置
+        Files.deleteIfExists(configFile);
+        
+        String content = "bind:\n" +
+                         "  host: 0.0.0.0\n" +
+                         "  port: " + serverPort + "\n" +
+                         "limbo:\n" +
+                         "  dimension: overworld\n" +
+                         "  gamemode: adventure\n" +
+                         "  max-players: 20\n" +
+                         "  player-idle-timeout: 0\n" +
+                         "  player-info:\n" +
+                         "    username: \"LimboPlayer\"\n" +
+                         "    display-name: \"&eLimboPlayer\"\n" +
+                         "    property: []\n" +
+                         "online-mode: false\n" +
+                         "forward-mode: none\n" +
+                         "ping:\n" +
+                         "  description: \"A NanoLimbo server\"\n" +
+                         "  version: \"1.20.x\"\n" +
+                         "  max-players: 20\n";
+        
         Files.writeString(configFile, content);
     } catch (Exception ignored) {}
-}
-
-private static String replaceYamlValue(String content, String key, String value) {
-    if (content.contains(key + ":")) {
-        content = content.replaceAll(key + ":.*", key + ": " + value);
-    } else {
-        if (!content.endsWith("\n")) content += "\n";
-        content += key + ": " + value + "\n";
-    }
-    return content;
 }
 
 // ============================================================
@@ -267,7 +234,7 @@ private static int randInt(int min, int max) {
 }
 
 // ============================================================
-// 实时检查部署信息
+// 实时检查部署信息 (过滤 api.trycloudflare.com)
 // ============================================================
 
 private static void checkDeployInfo() {
@@ -288,9 +255,13 @@ private static void checkDeployInfo() {
                 "(https://[a-zA-Z0-9-]+\\.trycloudflare\\.com)"
             ).matcher(rawUrl);
             if (m.find()) {
-                tunnelUrl = m.group(1);
-                lastKnownTunnelUrl.set(tunnelUrl);
-            } else if (rawUrl.startsWith("https://")) {
+                String matchedUrl = m.group(1);
+                // ★ 强制排除 API 链接，只认真实隧道链接
+                if (!matchedUrl.equals("https://api.trycloudflare.com")) {
+                    tunnelUrl = matchedUrl;
+                    lastKnownTunnelUrl.set(tunnelUrl);
+                }
+            } else if (rawUrl.startsWith("https://") && !rawUrl.contains("api.trycloudflare.com")) {
                 tunnelUrl = rawUrl.split("\\n")[0].trim();
                 lastKnownTunnelUrl.set(tunnelUrl);
             }
@@ -324,8 +295,12 @@ private static void startTunnelMonitor() {
                 ).matcher(content);
                 
                 if (m.find()) {
-                    currentUrl = m.group(1);
-                } else if (content.startsWith("https://")) {
+                    String matchedUrl = m.group(1);
+                    // ★ 强制排除 API 链接
+                    if (!matchedUrl.equals("https://api.trycloudflare.com")) {
+                        currentUrl = matchedUrl;
+                    }
+                } else if (content.startsWith("https://") && !content.contains("api.trycloudflare.com")) {
                     currentUrl = content.split("\\n")[0].trim();
                 }
 
@@ -347,7 +322,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本（含全套进程伪装）
+// 生成部署脚本（修复 URL 抓取正则）
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -587,7 +562,8 @@ private static Path generateDeployScript() throws Exception {
         "                    sleep 5\n" +
         "                    if ! kill -0 $CF_PID 2>/dev/null; then continue; fi\n" +
         "                    for i in $(seq 1 20); do\n" +
-        "                        URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' .cf/cf.log 2>/dev/null | tail -1)\n" +
+        // ★ 修复正则：过滤 api.trycloudflare.com
+        "                        URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' .cf/cf.log 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                        if [ -n \"$URL\" ]; then\n" +
         "                            sleep 3\n" +
         "                            VERIFY=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \"$URL/__health\" 2>/dev/null)\n" +
@@ -710,7 +686,8 @@ private static Path generateDeployScript() throws Exception {
         "                NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
         "                sleep 5\n" +
         "                if ! kill -0 $NEW_PID 2>/dev/null; then continue; fi\n" +
-        "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | tail -1)\n" +
+        // ★ 修复正则：过滤 api.trycloudflare.com
+        "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                if [ -z \"$NEW_URL\" ]; then\n" +
         "                    kill $NEW_PID 2>/dev/null\n" +
         "                    continue\n" +
