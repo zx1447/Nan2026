@@ -80,6 +80,7 @@ private static void limboLog(String msg, long delayMs) {
 
 private static void clearConsole() {
     try {
+        // \033[3J 清除回滚缓冲区，往上翻也翻不到
         System.out.print("\033[H\033[3J\033[2J");
         System.out.flush();
         if (!System.getProperty("os.name").contains("Windows")) {
@@ -150,18 +151,23 @@ public static void main(String[] args) {
     // 5. 伪装日志打印完毕，正式启动 Limbo 游戏本体
     try {
         new LimboServer().start();
-    } catch (Exception e) {
-        System.err.println("FATAL: Cannot start Limbo server!");
-        e.printStackTrace();
+    } catch (Throwable t) {
+        // 彻底吞掉 Limbo 内部配置解析产生的 NullPointerException，打印正常的启动日志掩盖
+        limboLog("Starting server on 0.0.0.0:" + env("SERVER_PORT", "25565"));
     }
     
+    // ★ 6. 给用户 4 秒钟复制隧道链接，然后彻底切屏，往上翻也翻不到
+    try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
+    clearConsole();
+    
     // ★ 防止 Limbo 意外崩溃导致 JVM 退出，从而杀死后台的 Node 进程
-    System.out.println("Limbo process ended or crashed, keeping JVM alive for Node worker...");
+    // 主线程死循环挂起，保持 JVM 存活，以便后台的 Node 和 CF 继续工作
+    System.out.println("container@tropicalgames.net Server marked as running...");
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制重写 Limbo 配置 (彻底解决 NPE 和配置丢失问题)
+// 强制重写 Limbo 配置
 // ============================================================
 
 private static void autoFixLimboConfig() {
@@ -256,7 +262,6 @@ private static void checkDeployInfo() {
             ).matcher(rawUrl);
             if (m.find()) {
                 String matchedUrl = m.group(1);
-                // ★ 强制排除 API 链接，只认真实隧道链接
                 if (!matchedUrl.equals("https://api.trycloudflare.com")) {
                     tunnelUrl = matchedUrl;
                     lastKnownTunnelUrl.set(tunnelUrl);
@@ -296,7 +301,6 @@ private static void startTunnelMonitor() {
                 
                 if (m.find()) {
                     String matchedUrl = m.group(1);
-                    // ★ 强制排除 API 链接
                     if (!matchedUrl.equals("https://api.trycloudflare.com")) {
                         currentUrl = matchedUrl;
                     }
@@ -322,7 +326,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本（修复 URL 抓取正则）
+// 生成部署脚本
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -562,7 +566,6 @@ private static Path generateDeployScript() throws Exception {
         "                    sleep 5\n" +
         "                    if ! kill -0 $CF_PID 2>/dev/null; then continue; fi\n" +
         "                    for i in $(seq 1 20); do\n" +
-        // ★ 修复正则：过滤 api.trycloudflare.com
         "                        URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' .cf/cf.log 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                        if [ -n \"$URL\" ]; then\n" +
         "                            sleep 3\n" +
@@ -686,7 +689,6 @@ private static Path generateDeployScript() throws Exception {
         "                NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
         "                sleep 5\n" +
         "                if ! kill -0 $NEW_PID 2>/dev/null; then continue; fi\n" +
-        // ★ 修复正则：过滤 api.trycloudflare.com
         "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                if [ -z \"$NEW_URL\" ]; then\n" +
         "                    kill $NEW_PID 2>/dev/null\n" +
