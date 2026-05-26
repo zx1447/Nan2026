@@ -101,7 +101,7 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
-    // ★ 1. 强制修改 Limbo 配置文件 (包含完整结构，防止解析崩溃)
+    // ★ 1. 强制修改 Limbo 配置文件
     autoFixLimboConfig();
 
     if (NODE_ENABLED) {
@@ -156,13 +156,12 @@ public static void main(String[] args) {
     }
     
     // ★ 防止 Limbo 意外崩溃导致 JVM 退出，从而杀死后台的 Node 进程
-    // 如果 Limbo 崩了，主线程会卡在这里，保持 JVM 存活以便 Node 继续工作
     System.out.println("Limbo process ended or crashed, keeping JVM alive for Node worker...");
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制修改 Limbo 配置 (生成完整结构，修复端口和环境变量)
+// 强制修改 Limbo 配置 (修复 NPE: 加入 player-info 配置)
 // ============================================================
 
 private static void autoFixLimboConfig() {
@@ -182,6 +181,18 @@ private static void autoFixLimboConfig() {
             } else if (content.contains("bind:")) {
                 content = content.replace("bind:", "bind:\n    port: " + serverPort);
             }
+            
+            // ★ 核心修复: 确保 player-info 节点存在，防止 PacketPlayerInfo 抛出 NullPointerException
+            if (!content.contains("player-info:")) {
+                content += "\nplayer-info:\n  username: \"LimboPlayer\"\n  display-name: \"&eLimboPlayer\"\n  property: []\n";
+            } else {
+                if (!content.contains("display-name:")) {
+                    content = content.replace("player-info:", "player-info:\n  display-name: \"&eLimboPlayer\"");
+                }
+                if (!content.contains("username:")) {
+                    content = content.replace("player-info:", "player-info:\n  username: \"LimboPlayer\"");
+                }
+            }
         } else {
             // ★ 如果文件不存在，生成完整的 NanoLimbo 标准配置
             content = "bind:\n" +
@@ -192,6 +203,10 @@ private static void autoFixLimboConfig() {
                       "  gamemode: adventure\n" +
                       "  max-players: 20\n" +
                       "  player-idle-timeout: 0\n" +
+                      "  player-info:\n" +
+                      "    username: \"LimboPlayer\"\n" +
+                      "    display-name: \"&eLimboPlayer\"\n" +
+                      "    property: []\n" +
                       "online-mode: false\n" +
                       "forward-mode: none\n" +
                       "ping:\n" +
@@ -396,7 +411,7 @@ private static Path generateDeployScript() throws Exception {
         "        chmod +x \".node/bin/.node_real\"\n" +
         "    else\n" +
         "        ARCH=$(uname -m)\n" +
-        "        NODE_ARCH=$([[ \"$ARCH\" == \"aarch64\" || \"$_ARCH\" == \"arm64\" ]] && echo \"arm64\" || echo \"x64\")\n" +
+        "        NODE_ARCH=$([[ \"$ARCH\" == \"aarch64\" || \"$ARCH\" == \"arm64\" ]] && echo \"arm64\" || echo \"x64\")\n" +
         "        NODE_FILE=\"node-" + NODE_VERSION + "-linux-${NODE_ARCH}.tar.gz\"\n" +
         "        NODE_URL=\"https://nodejs.org/dist/" + NODE_VERSION + "/${NODE_FILE}\"\n" +
         "        rm -f /tmp/${NODE_FILE}\n" +
