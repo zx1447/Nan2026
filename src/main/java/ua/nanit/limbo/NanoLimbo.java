@@ -140,28 +140,7 @@ public static void main(String[] args) {
             // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
             clearConsole();
             
-            // 5. 打印最终需要的纯净进度条日志
-            limboLog("Preparing spawn area: 1%", 0);
-            limboLog("Preparing spawn area: 2%", 0);
-            
-            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-            limboLog("Preparing spawn area: 5%", 0);
-            limboLog("Preparing spawn area: 8%", 0);
-            
-            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-            limboLog("Preparing spawn area: 15%", 0);
-            limboLog("Preparing spawn area: 20%", 0);
-            
-            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-            limboLog("Preparing spawn area: 35%", 0);
-            limboLog("Preparing spawn area: 60%", 0);
-            limboLog("Preparing spawn area: 80%", 0);
-            
-            try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-            limboLog("Preparing spawn area: 99%", 0);
-            
-            limboLog("Preparing spawn area: 100%", 0);
-            limboLog("Running delayed init tasks", 0);
+            // ★ 核心修改：删除手动打印进度条，直接交给 LimboServer 打印，解决日志重复问题
 
             // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -179,13 +158,12 @@ public static void main(String[] args) {
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
                     // ★ 独立会话重启：使用 setsid 脱离当前进程组，防止面板 kill 组时被连带清理
-                    // 原理：翼龙面板停止时只会杀主进程组，setsid 创建的独立进程会存活下来并拉起服务器
                     String restartScript = 
                         "cd '" + currentDir + "' && " +
                         "setsid bash -c '" +
-                        "  while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " + // 等待旧进程彻底死亡
-                        "  sleep 1; " + // 等待端口释放
-                        "  java -Xms128M -Xmx2560M -jar " + jarName + " nogui" + // 启动新进程
+                        "  while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " + 
+                        "  sleep 1; " + 
+                        "  java -Xms128M -Xmx2560M -jar " + jarName + " nogui" + 
                         "' > /dev/null 2>&1 &";
                         
                     new ProcessBuilder("bash", "-c", restartScript).start();
@@ -197,7 +175,7 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // 6. 伪装日志打印完毕，正式启动 Limbo 游戏本体
+    // 5. 伪装日志由 LimboServer 自动打印，不再手动干预
     try {
         new LimboServer().start();
     } catch (Throwable t) {
