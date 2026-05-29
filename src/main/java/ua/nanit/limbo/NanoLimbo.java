@@ -90,7 +90,7 @@ private static float randFloat(float min, float max) {
     return Math.round((min + (float)(Math.random() * (max - min))) * 10.0f) / 10.0f;
 }
 
-// ★ 核心：只打印到 100%，故意不输出 Done，让面板永远卡在 Starting 状态
+// ★ 核心：只输出到 83%，故意不输出 Done，让面板永远卡在 Starting 状态
 private static void printFakeMinecraftStartup() {
     limboLog("Starting minecraft server version 1.21.11", randInt(100, 300));
     limboLog("Loading properties", randInt(300, 600));
@@ -112,10 +112,8 @@ private static void printFakeMinecraftStartup() {
     limboLog("Preparing spawn area: 60%", 0);
     limboLog("Preparing spawn area: 80%", 0);
     try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 99%", 0);
-    limboLog("Preparing spawn area: 100%", 0);
-    
-    // 故意不输出 Done 日志！面板等不到 Done，就会永远卡在 Starting 状态
+    // 故意停在 83%，看起来像是加载世界时卡死了，永远不输出 Done
+    limboLog("Preparing spawn area: 83%", 0);
 }
 
 // ============================================================
