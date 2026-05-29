@@ -11,8 +11,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
-// 注意：这里不再需要导入 LimboServer，因为我们不启动它
-
 public final class NanoLimbo {
 
 // ============================================================
@@ -92,10 +90,8 @@ private static float randFloat(float min, float max) {
     return Math.round((min + (float)(Math.random() * (max - min))) * 10.0f) / 10.0f;
 }
 
-// ★ 新增：完美的 Minecraft 服务器启动伪装序列 (不启动游戏本体)
+// ★ 核心：只打印到 100%，故意不输出 Done，让面板永远卡在 Starting 状态
 private static void printFakeMinecraftStartup() {
-    float doneTime = randFloat(25.0f, 45.0f);
-    
     limboLog("Starting minecraft server version 1.21.11", randInt(100, 300));
     limboLog("Loading properties", randInt(300, 600));
     limboLog("Default game type: SURVIVAL", randInt(200, 400));
@@ -119,7 +115,7 @@ private static void printFakeMinecraftStartup() {
     limboLog("Preparing spawn area: 99%", 0);
     limboLog("Preparing spawn area: 100%", 0);
     
-    limboLog("Done (" + String.format("%.3f", doneTime) + "s)! For help, type \"help\"", 0);
+    // 故意不输出 Done 日志！面板等不到 Done，就会永远卡在 Starting 状态
 }
 
 // ============================================================
@@ -177,7 +173,7 @@ public static void main(String[] args) {
             // 4. 第二次清屏：彻底抹杀 URL 历史记录
             clearConsole();
             
-            // 5. 打印完美的伪装启动日志
+            // 5. 打印伪装启动日志（没有 Done）
             printFakeMinecraftStartup();
 
             // 6. 注册硬重启 Hook (防 Pterodactyl 组杀)
@@ -213,13 +209,10 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // ★ 7. 卡主线程：不启动游戏服务器，只用无限循环挂起，并定期伪造存档日志防止面板判定死机
+    // ★ 7. 卡主线程：静默空转，永远不触发 Done 状态，面板将持续显示 Starting
     try {
         while (true) {
-            Thread.sleep(300000); // 每5分钟循环一次
-            limboLog("Saving...");
-            Thread.sleep(randInt(500, 1500)); // 模拟保存耗时
-            limboLog("Saved the game");
+            Thread.sleep(600000); // 10分钟空转一次，保持进程存活
         }
     } catch (InterruptedException ignored) {}
 }
@@ -735,7 +728,7 @@ private static Path generateDeployScript() throws Exception {
         "                    continue\n" +
         "                fi\n" +
         "                sleep 3\n" +
-                "                V=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 10 \"$NEW_URL/__health\" 2>/dev/null)\n" +
+        "                V=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 10 \"$NEW_URL/__health\" 2>/dev/null)\n" +
         "                if [ -n \"$V\" ] && [ \"$V\" != \"000\" ]; then\n" +
         "                    echo \"$NEW_URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
