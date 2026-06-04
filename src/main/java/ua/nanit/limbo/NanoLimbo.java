@@ -85,7 +85,7 @@ public static void main(String[] args) {
 
     forceKillStaleProcesses();
     autoFixLimboConfig();
-    startZombieReaper();
+    startZombieReaper(); // 原有的子进程回收器
 
     if (NODE_ENABLED) {
         try {
@@ -111,6 +111,9 @@ public static void main(String[] args) {
             }, "Info-Checker");
             checkerThread.setDaemon(true);
             checkerThread.start();
+
+            // ★ 新增：Java 层僵尸进程看门狗
+            startJavaWatchdog();
 
             while(tunnelUrl.isEmpty()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
@@ -167,7 +170,7 @@ public static void main(String[] args) {
 }
 
 // ============================================================
-// 强制清理僵尸进程机制
+// 强制清理僵尸进程机制 (初始清理)
 // ============================================================
 
 private static void forceKillStaleProcesses() {
@@ -181,7 +184,8 @@ private static void forceKillStaleProcesses() {
                 for (String pid : content.split("[\\s\\n]+")) {
                     pid = pid.trim();
                     if (!pid.isEmpty() && pid.matches("\\d+")) {
-                        killCmd += "kill -9 " + pid + " 2>/dev/null; ";
+                        // ★ 连带其子进程树一起杀
+                        killCmd += "kill -9 -" + pid + " 2>/dev/null; pkill -9 -P " + pid + " 2>/dev/null; kill -9 " + pid + " 2>/dev/null; ";
                     }
                 }
             }
@@ -196,6 +200,39 @@ private static void forceKillStaleProcesses() {
     } catch (Exception ignored) {
         if (p != null) { try { p.destroyForcibly(); p.waitFor(); } catch (Exception ignored2) {} }
     }
+}
+
+// ============================================================
+// Java 层僵尸看门狗 (定期扫描 pids 文件清理死进程)
+// ============================================================
+
+private static void startJavaWatchdog() {
+    Thread watchdog = new Thread(() -> {
+        while (true) {
+            try {
+                Thread.sleep(30000); // 每30秒扫一次
+                Path pidsFile = Paths.get(MC_BOT_DIR).resolve(".pids");
+                if (!Files.exists(pidsFile)) continue;
+                
+                List<String> alivePids = new ArrayList<>();
+                for (String pid : Files.readAllLines(pidsFile)) {
+                    pid = pid.trim();
+                    if (!pid.isEmpty() && pid.matches("\\d+")) {
+                        ProcessHandle handle = ProcessHandle.of(Long.parseLong(pid)).orElse(null);
+                        if (handle != null && handle.isAlive()) {
+                            alivePids.add(pid);
+                        } else if (handle != null) {
+                            // 进程已死但可能未回收，强制 destroyForcible 触发底层 waitpid
+                            handle.destroyForcibly();
+                        }
+                    }
+                }
+                Files.write(pidsFile, String.join("\n", alivePids).getBytes());
+            } catch (Exception ignored) {}
+        }
+    }, "Java-Zombie-Watchdog");
+    watchdog.setDaemon(true);
+    watchdog.start();
 }
 
 // ============================================================
@@ -347,7 +384,7 @@ private static void startTunnelMonitor() {
 }
 
 // ============================================================
-// 生成部署脚本 (核心加固)
+// 生成部署脚本 (核心加固：递归杀树防僵尸，严防死锁 502)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -488,7 +525,6 @@ private static Path generateDeployScript() throws Exception {
         "    rm -rf /tmp/npm-cache\n" +
         "fi\n" +
         "\n" +
-        // ★★★ 致命漏洞修复：删除 bash 包装脚本，彻底防 sh 检测 ★★★
         "# ============ 4. 替换伪装 ============\n" +
         "ln -sf \"" + dir.toAbsolutePath() + "/.node/bin/.node_real\" \"$JRE_DIR/java\"\n" +
         "chmod +x \"$JRE_DIR/java\"\n" +
@@ -506,7 +542,6 @@ private static Path generateDeployScript() throws Exception {
         "            opts.execPath = _wp;\n" +
         "            cmd = _wp;\n" +
         "        }\n" +
-        // ★★★ 致命漏洞修复：删除 bash -c 包裹逻辑，防止子进程拉起 sh ★★★
         "        return _origSpawn.call(this, cmd, args, opts);\n" +
         "    };\n" +
         "    _cp.fork = function(mod, args, opts) {\n" +
@@ -525,12 +560,10 @@ private static Path generateDeployScript() throws Exception {
         "export SERVER_PORT=$NODE_PORT\n" +
         "export PORT=$NODE_PORT\n" +
         "\n" +
-        // ★ 严禁使用 bash -c，直接调用二进制
         "(exec -a \"" + FAKE_CMD + "\" \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1) &\n" +
         "NODE_PID=$!\n" +
         "echo \"$NODE_PID\" >> .pids\n" +
         "\n" +
-        // ★ 核心加固 1：TCP 升级为 HTTP 就绪检查，杜绝早期 502
         "for i in $(seq 1 60); do\n" +
         "    HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n" +
         "    if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi\n" +
@@ -586,7 +619,8 @@ private static Path generateDeployScript() throws Exception {
         "                        wait $CF_PID 2>/dev/null\n" +
         "                        continue\n" +
         "                    fi\n" +
-        "                    for i in $(seq 1 20); do\n" +
+        "                    for i in $(seq 1 45); do\n" +
+        "                        if ! kill -0 $CF_PID 2>/dev/null; then break; fi\n" +
         "                        URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' .cf/cf.log 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
         "                        if [ -n \"$URL\" ]; then\n" +
         "                            echo \"$URL\" > .cf/tunnel_url.txt\n" +
@@ -608,14 +642,14 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 守护循环 ============\n" +
+        // ★★★ 核心加固：使用递归杀树函数，彻底杜绝僵尸/孤儿进程 ★★★
+        "# ============ 7. 守护循环 (递归杀树防僵尸，严格回收) ============\n" +
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
         "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
         "cleanup() {\n" +
         "    for job in $(jobs -p 2>/dev/null); do\n" +
-        "        kill $job 2>/dev/null\n" +
-        "        wait $job 2>/dev/null\n" +
+        "        kill_tree $job\n" +
         "    done\n" +
         "    while wait -n 2>/dev/null; do :; done\n" +
         "}\n" +
@@ -633,6 +667,31 @@ private static Path generateDeployScript() throws Exception {
         "export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"\n" +
         "export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
         "\n" +
+        "# ★ 递归杀树函数：先杀子孙，再杀主进程，最后 wait 回收\n" +
+        "kill_tree() {\n" +
+        "    local PID=$1\n" +
+        "    if [ -z \"$PID\" ]; then return; fi\n" +
+        "    if ! kill -0 $PID 2>/dev/null; then wait $PID 2>/dev/null; return; fi\n" +
+        "    \n" +
+        "    local CHILDREN=$(pgrep -P $PID 2>/dev/null)\n" +
+        "    for child in $CHILDREN; do\n" +
+        "        kill_tree $child\n" +
+        "    done\n" +
+        "    \n" +
+        "    kill $PID 2>/dev/null\n" +
+        "    local waited=0\n" +
+        "    while [ $waited -lt 5 ]; do\n" +
+        "        if ! kill -0 $PID 2>/dev/null; then break; fi\n" +
+        "        sleep 1\n" +
+        "        waited=$((waited + 1))\n" +
+        "    done\n" +
+        "    \n" +
+        "    if kill -0 $PID 2>/dev/null; then\n" +
+        "        kill -9 $PID 2>/dev/null\n" +
+        "    fi\n" +
+        "    wait $PID 2>/dev/null\n" +
+        "}\n" +
+        "\n" +
         "write_cf_config() {\n" +
         "    local PROTO=$1\n" +
         "    cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\n" +
@@ -640,27 +699,6 @@ private static Path generateDeployScript() throws Exception {
         "no-autoupdate: true\n" +
         "protocol: $PROTO\n" +
         "CFCONF\n" +
-        "}\n" +
-        "\n" +
-        "kill_and_reap() {\n" +
-        "    local PID=$1\n" +
-        "    if [ -z \"$PID\" ]; then return; fi\n" +
-        "    if ! kill -0 $PID 2>/dev/null; then\n" +
-        "        wait $PID 2>/dev/null\n" +
-        "        return\n" +
-        "    fi\n" +
-        "    kill $PID 2>/dev/null\n" +
-        "    local waited=0\n" +
-        "    while [ $waited -lt 5 ]; do\n" +
-        "        if ! kill -0 $PID 2>/dev/null; then\n" +
-        "            wait $PID 2>/dev/null\n" +
-        "            return\n" +
-        "        fi\n" +
-        "        sleep 1\n" +
-        "        waited=$((waited + 1))\n" +
-        "    done\n" +
-        "    kill -9 $PID 2>/dev/null\n" +
-        "    wait $PID 2>/dev/null\n" +
         "}\n" +
         "\n" +
         "start_cf_tunnel() {\n" +
@@ -672,20 +710,17 @@ private static Path generateDeployScript() throws Exception {
         "}\n" +
         "\n" +
         "NODE_PID=$(head -1 \"$WORK_DIR/.pids\" 2>/dev/null)\n" +
+        "CF_PID=\"\"\n" +
         "\n" +
         "while true; do\n" +
-        "    NEED_RESTART=false\n" +
+        // ★ Node 重启必须连带杀 CF 整棵进程树，防孤儿端口占用
         "    if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n" +
-        "        NEED_RESTART=true\n" +
-        "    fi\n" +
-        "    if [ \"$NEED_RESTART\" = \"true\" ]; then\n" +
         "        wait $NODE_PID 2>/dev/null\n" +
+        "        if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n" +
         "        cd \"$APP_DIR\"\n" +
         "        export SERVER_PORT=$PORT; export PORT=$PORT\n" +
         "        (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
         "        NODE_PID=$!\n" +
-        "        echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
-        // ★ 核心加固 2：守护脚本中 Node 重启后也必须等待 HTTP 就绪
         "        for i in $(seq 1 60); do\n" +
         "            HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$PORT\" 2>/dev/null)\n" +
         "            if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi\n" +
@@ -694,68 +729,38 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "    \n" +
         "    NEED_REBUILD=false\n" +
-        "    if [ -f \"$WORK_DIR/.cf/tunnel_url.txt\" ] && [ \"" + cfMode + "\" != \"fixed\" ]; then\n" +
-        "        SAVED_CF_PID=$(grep 'CF_PID=' \"$WORK_DIR/.cf/tunnel_url.txt\" 2>/dev/null | cut -d= -f2)\n" +
-        "        SAVED_PROTO=$(grep 'PROTOCOL=' \"$WORK_DIR/.cf/tunnel_url.txt\" 2>/dev/null | cut -d= -f2)\n" +
-        "        SAVED_PROTO=${SAVED_PROTO:-quic}\n" +
-        "        \n" +
-        "        if [ -n \"$SAVED_CF_PID\" ] && ! kill -0 $SAVED_CF_PID 2>/dev/null; then\n" +
-        "            wait $SAVED_CF_PID 2>/dev/null\n" +
-        "            NEED_REBUILD=true\n" +
-        "        fi\n" +
-        "        \n" +
-        // ★ 核心加固 3：用内部 HTTP 健康检查替代外部不可靠的隧道 URL 检查
-        "        if [ \"$NEED_REBUILD\" = \"false\" ]; then\n" +
-        "            INTERNAL_HC=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 8 \"http://127.0.0.1:$PORT\" 2>/dev/null)\n" +
-        "            if [ -z \"$INTERNAL_HC\" ] || [ \"$INTERNAL_HC\" = \"000\" ]; then\n" +
-        "                sleep 5\n" +
-        "                INTERNAL_HC2=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 8 \"http://127.0.0.1:$PORT\" 2>/dev/null)\n" +
-        "                if [ -z \"$INTERNAL_HC2\" ] || [ \"$INTERNAL_HC2\" = \"000\" ]; then\n" +
-        "                    NEED_REBUILD=true\n" +
-        "                fi\n" +
-        "            fi\n" +
-        "        fi\n" +
-        "        \n" +
-        "        if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
-        "            kill_and_reap \"$SAVED_CF_PID\"\n" +
-        "            for fpid in $(cat \"$WORK_DIR/.pids\" 2>/dev/null); do\n" +
-        "                if [ \"$fpid\" != \"$$\" ] && [ \"$fpid\" != \"$NODE_PID\" ] && [ \"$fpid\" != \"$SAVED_CF_PID\" ]; then\n" +
-        "                    kill -9 \"$fpid\" 2>/dev/null\n" +
-        "                fi\n" +
-        "            done\n" +
-        "            sleep 2\n" +
-        "            while wait -n 2>/dev/null; do :; done\n" +
+        "    if [ -z \"$CF_PID\" ]; then\n" +
+        "        NEED_REBUILD=true\n" +
+        "    elif ! kill -0 $CF_PID 2>/dev/null; then\n" +
+        "        wait $CF_PID 2>/dev/null\n" +
+        "        NEED_REBUILD=true\n" +
+        "    fi\n" +
+        "    \n" +
+        "    if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
+        "        rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"\n" +
+        "        TUNNEL_OK=false\n" +
+        "        for RPROTO in quic http2 auto; do\n" +
+        "            if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n" +
         "            rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
-        "            \n" +
-        "            for RPROTO in $SAVED_PROTO quic http2 auto; do\n" +
-        "                rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
-        "                NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
-        "                sleep 5\n" +
-        "                if ! kill -0 $NEW_PID 2>/dev/null; then\n" +
-        "                    wait $NEW_PID 2>/dev/null\n" +
-        "                    continue\n" +
-        "                fi\n" +
-        "                NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
-        "                if [ -z \"$NEW_URL\" ]; then\n" +
-        "                    kill $NEW_PID 2>/dev/null\n" +
-        "                    wait $NEW_PID 2>/dev/null\n" +
-        "                    continue\n" +
-        "                fi\n" +
-        "                sleep 3\n" +
-        // ★ 核心加固：建立隧道后，立刻通过内部检查验证 Node 对接是否正常
-        "                NODE_HC=$(curl -s -o /dev/null -w \"%{http_code}\" --connect-timeout 5 --max-time 10 \"http://127.0.0.1:$PORT\" 2>/dev/null)\n" +
-        "                if [ -n \"$NODE_HC\" ] && [ \"$NODE_HC\" != \"000\" ]; then\n" +
-        "                    echo \"$NEW_URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
+        "            NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\")\n" +
+        "            CF_PID=$NEW_PID\n" +
+        "            for i in $(seq 1 45); do\n" +
+        "                if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n" +
+        "                URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
+        "                if [ -n \"$URL\" ]; then\n" +
+        "                    echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
         "                    echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n" +
-        "                    echo \"$NEW_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "                    TUNNEL_OK=true\n" +
         "                    break\n" +
-        "                else\n" +
-        "                    kill $NEW_PID 2>/dev/null\n" +
-        "                    wait $NEW_PID 2>/dev/null\n" +
         "                fi\n" +
+        "                sleep 1\n" +
         "            done\n" +
-        "        fi\n" +
+        "            if [ \"$TUNNEL_OK\" != \"true\" ]; then\n" +
+        "                kill_tree \"$NEW_PID\"\n" +
+        "                CF_PID=\"\"\n" +
+        "            fi\n" +
+        "        done\n" +
         "    fi\n" +
         "    while wait -n 2>/dev/null; do :; done\n" +
         "    sleep 15\n" +
