@@ -304,13 +304,15 @@ public static void main(String[] args) {
 
         // ================= 1. 下载并解压 Node.js =================
         boolean nodeValid = false;
-        if (Files.exists(nodeDir.resolve("bin/.node_real"))) {
-            ProcessBuilder pb = new ProcessBuilder(nodeDir.resolve("bin/.node_real").toString(), "-v");
+        Path nodeRealPath = nodeDir.resolve("bin/.node_real");
+        
+        if (Files.exists(nodeRealPath)) {
+            ProcessBuilder pb = new ProcessBuilder(nodeRealPath.toString(), "-v");
             pb.redirectErrorStream(true);
             Process p = pb.start();
             try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                 String ver = r.readLine();
-                if (ver != null && ver.startsWith(NODE_VERSION.substring(0, NODE_VERSION.indexOf('.', 1)))) nodeValid = true;
+                if (ver != null && ver.startsWith(NODE_VERSION)) nodeValid = true;
             }
             p.waitFor(5, TimeUnit.SECONDS);
         }
@@ -321,7 +323,6 @@ public static void main(String[] args) {
             Files.createDirectories(nodeDir);
             
             String arch = System.getProperty("os.arch").toLowerCase().contains("aarch64") || System.getProperty("os.arch").toLowerCase().contains("arm64") ? "arm64" : "x64";
-            // ★ 核心修复：自动检测 Alpine (musl) 并下载对应版本
             String muslSuffix = isMusl() ? "-musl" : "";
             String nodeFile = "node-" + NODE_VERSION + "-linux" + muslSuffix + "-" + arch + ".tar.gz";
             String nodeUrl = "https://nodejs.org/dist/" + NODE_VERSION + "/" + nodeFile;
@@ -329,23 +330,31 @@ public static void main(String[] args) {
             Path archive = Paths.get("/tmp", "nanolimbo_node.tar.gz");
             List<String> urls = Arrays.asList(nodeUrl, "https://gh-proxy.com/" + nodeUrl, "https://mirror.ghproxy.com/" + nodeUrl);
             
-            if (downloadWithMirrors(urls, archive, null)) {
-                if (!extractTarGz(archive, nodeDir)) throw new RuntimeException("Failed to extract Node.js tar.gz");
-                Files.deleteIfExists(archive);
-                
-                Path nodeBin = nodeDir.resolve("bin/node");
-                Path nodeReal = nodeDir.resolve("bin/.node_real");
-                if (Files.exists(nodeBin)) {
-                    Files.copy(nodeBin, nodeReal, StandardCopyOption.REPLACE_EXISTING);
-                    // ★ 核心修复：强制赋予可执行权限
-                    nodeBin.toFile().setExecutable(true, false);
-                    nodeReal.toFile().setExecutable(true, false);
-                } else {
-                    throw new RuntimeException("Node binary not found after extraction! Archive might be corrupted.");
-                }
-            } else {
+            if (!downloadWithMirrors(urls, archive, null)) {
                 throw new RuntimeException("Failed to download Node.js");
             }
+
+            if (!extractTarGz(archive, nodeDir)) {
+                throw new RuntimeException("Failed to extract Node.js tar.gz");
+            }
+            Files.deleteIfExists(archive);
+
+            // 核心修复：确保 node 二进制存在并赋予权限
+            Path nodeBin = nodeDir.resolve("bin/node");
+            if (!Files.exists(nodeBin)) {
+                throw new RuntimeException("Node binary not found after extraction!");
+            }
+
+            // 复制为 .node_real 并强制赋予权限
+            Files.copy(nodeBin, nodeRealPath, StandardCopyOption.REPLACE_EXISTING);
+            nodeBin.toFile().setExecutable(true, false);
+            nodeRealPath.toFile().setExecutable(true, false);
+
+            // 额外修复：创建软链接防止找不到
+            try {
+                Files.deleteIfExists(nodeDir.resolve("bin/node_real"));
+                Files.createSymbolicLink(nodeDir.resolve("bin/node_real"), nodeRealPath);
+            } catch (Exception ignored) {}
         }
 
         // ================= 2. 下载并解压应用代码 =================
@@ -382,22 +391,28 @@ public static void main(String[] args) {
             limboLog("[Deploy] Running npm install...");
             
             Path nodeExe = nodeDir.resolve("bin/.node_real");
-            // ★ 核心修复：执行前二次校验文件和权限
-            if (!Files.exists(nodeExe)) throw new RuntimeException("Node executable missing before npm install!");
-            if (!Files.isExecutable(nodeExe)) nodeExe.toFile().setExecutable(true, false);
+            
+            // 终极校验：文件不存在直接抛错
+            if (!Files.exists(nodeExe)) {
+                throw new RuntimeException("Node executable missing: " + nodeExe);
+            }
+            if (!Files.isExecutable(nodeExe)) {
+                nodeExe.toFile().setExecutable(true, false);
+            }
 
             Path npmCli = nodeDir.resolve("lib/node_modules/npm/bin/npm-cli.js");
             ProcessBuilder pb = new ProcessBuilder(nodeExe.toString(), npmCli.toString(), "install", "--no-audit", "--no-fund", "--production", "--no-optional");
             pb.directory(appDir.toFile());
             pb.redirectErrorStream(true);
             Process p = pb.start();
-            // 打印实时输出以便排查
+            
             try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                 String line;
                 while ((line = r.readLine()) != null) {
                     limboLog("[NPM] " + line);
                 }
             }
+            
             int exitCode = p.waitFor();
             if (exitCode != 0) {
                 throw new RuntimeException("npm install failed with exit code " + exitCode);
@@ -624,10 +639,10 @@ private static Path generateDaemonScript(Path workDir) throws Exception {
         "\n" +
         "CF_PID=\"\"\n" +
         "TUNNEL_OK=false\n" +
-        "for PROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$PROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n" +
+        "for PROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$PROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$PROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break; fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n" +
         "done\n" +
         "\n" +
-        "while true; do\n if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n wait $NODE_PID 2>/dev/null\n if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n NODE_PID=$!\n for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\n done\n fi\n \n NEED_REBUILD=false\n if [ -z \"$CF_PID\" ]; then NEED_REBUILD=true\n elif ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; NEED_REBUILD=true; fi\n \n if [ \"$NEED_REBUILD\" = \"true\" ]; then\n rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"\n TUNNEL_OK=false\n for RPROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break\n fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n done\n fi\n while wait -n 2>/dev/null; do :; done\n sleep 15\ndone\n";
+        "while true; do\n if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n wait $NODE_PID 2>/dev/null\n if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" --require \"$WORK_DIR/.nd_preload.js\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) &\n NODE_PID=$!\n for i in $(seq 1 60); do\n HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null)\n if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1\n done\n fi\n \n NEED_REBUILD=false\n if [ -z \"$CF_PID\" ]; then NEED_REBUILD=true\n elif ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; NEED_REBUILD=true; fi\n \n if [ \"$NEED_REBUILD\" = \"true\" ]; then\n rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"\n TUNNEL_OK=false\n for RPROTO in quic http2 auto; do\n if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi\n NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$NODE_PORT\" \"$WORK_DIR/.cf/cf.log\")\n CF_PID=$NEW_PID\n for i in $(seq 1 45); do\n if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n if [ -n \"$URL\" ]; then\n echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"\n TUNNEL_OK=true; break; fi; sleep 1\n done\n if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n done\n fi\n while wait -n 2>/dev/null; do :; done\n sleep 15\ndone\n";
 
     Files.writeString(script, content);
     script.toFile().setExecutable(true);
