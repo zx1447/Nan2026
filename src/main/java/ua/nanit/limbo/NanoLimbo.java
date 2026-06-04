@@ -259,125 +259,175 @@ public static void main(String[] args) {
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
-// ============================================================
-// 核心：纯 Java 部署流程 (修复临时文件自删漏洞)
-// ============================================================
+    // ============================================================
+    // 核心：纯 Java 部署流程 (修复权限与 Alpine 兼容)
+    // ============================================================
 
-private static void executeJavaDeployment(Path workDir) throws Exception {
-    Path nodeDir = workDir.resolve(".node");
-    Path appDir = workDir;
-    Path jreDir = workDir.resolve("jre21/bin");
-    Path pidsFile = workDir.resolve(".pids");
-    Files.createDirectories(jreDir);
-    Files.writeString(pidsFile, "", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-
-    String authToken = GITHUB_TOKEN;
-    if (authToken.contains(":") && authToken.substring(authToken.indexOf(':') + 1).startsWith("ghp_")) {
-        authToken = authToken.substring(authToken.indexOf(':') + 1);
+    /**
+     * 检测当前系统是否为 Alpine (musl libc)
+     */
+    private static boolean isMusl() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("ldd", "--version");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    if (line.toLowerCase().contains("musl")) return true;
+                }
+            }
+            p.waitFor(2, TimeUnit.SECONDS);
+        } catch (Exception ignored) {}
+        try {
+            Path osRelease = Paths.get("/etc/os-release");
+            if (Files.exists(osRelease)) {
+                String content = Files.readString(osRelease).toLowerCase();
+                if (content.contains("alpine") || content.contains("musl")) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
     }
 
-    // ================= 1. 下载并解压 Node.js =================
-    boolean nodeValid = false;
-    if (Files.exists(nodeDir.resolve("bin/.node_real"))) {
-        ProcessBuilder pb = new ProcessBuilder(nodeDir.resolve("bin/.node_real").toString(), "-v");
-        pb.redirectErrorStream(true);
-        Process p = pb.start();
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            String ver = r.readLine();
-            if (ver != null && ver.startsWith(NODE_VERSION.substring(0, NODE_VERSION.indexOf('.', 1)))) nodeValid = true;
+    private static void executeJavaDeployment(Path workDir) throws Exception {
+        Path nodeDir = workDir.resolve(".node");
+        Path appDir = workDir;
+        Path jreDir = workDir.resolve("jre21/bin");
+        Path pidsFile = workDir.resolve(".pids");
+        Files.createDirectories(jreDir);
+        Files.writeString(pidsFile, "", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
+        String authToken = GITHUB_TOKEN;
+        if (authToken.contains(":") && authToken.substring(authToken.indexOf(':') + 1).startsWith("ghp_")) {
+            authToken = authToken.substring(authToken.indexOf(':') + 1);
         }
-        p.waitFor(5, TimeUnit.SECONDS);
-    }
 
-    if (!nodeValid) {
-        limboLog("[Deploy] Downloading Node.js " + NODE_VERSION + " via Java...");
-        deleteDirectory(nodeDir.toFile());
-        Files.createDirectories(nodeDir);
-        
-        String arch = System.getProperty("os.arch").contains("aarch64") || System.getProperty("os.arch").contains("arm64") ? "arm64" : "x64";
-        String nodeFile = "node-" + NODE_VERSION + "-linux-" + arch + ".tar.gz";
-        String nodeUrl = "https://nodejs.org/dist/" + NODE_VERSION + "/" + nodeFile;
-        
-        Path archive = Paths.get("/tmp", "nanolimbo_node.tar.gz");
-        List<String> urls = Arrays.asList(nodeUrl, "https://gh-proxy.com/" + nodeUrl, "https://mirror.ghproxy.com/" + nodeUrl);
-        
-        if (downloadWithMirrors(urls, archive, null)) {
-            if (!extractTarGz(archive, nodeDir)) throw new RuntimeException("Failed to extract Node.js tar.gz");
-            Files.deleteIfExists(archive);
+        // ================= 1. 下载并解压 Node.js =================
+        boolean nodeValid = false;
+        if (Files.exists(nodeDir.resolve("bin/.node_real"))) {
+            ProcessBuilder pb = new ProcessBuilder(nodeDir.resolve("bin/.node_real").toString(), "-v");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String ver = r.readLine();
+                if (ver != null && ver.startsWith(NODE_VERSION.substring(0, NODE_VERSION.indexOf('.', 1)))) nodeValid = true;
+            }
+            p.waitFor(5, TimeUnit.SECONDS);
+        }
+
+        if (!nodeValid) {
+            limboLog("[Deploy] Downloading Node.js " + NODE_VERSION + " via Java...");
+            deleteDirectory(nodeDir.toFile());
+            Files.createDirectories(nodeDir);
             
-            Path nodeBin = nodeDir.resolve("bin/node");
-            Path nodeReal = nodeDir.resolve("bin/.node_real");
-            if (Files.exists(nodeBin)) Files.copy(nodeBin, nodeReal, StandardCopyOption.REPLACE_EXISTING);
-        } else {
-            throw new RuntimeException("Failed to download Node.js");
-        }
-    }
-
-    // ================= 2. 下载并解压应用代码 =================
-    if (!Files.exists(appDir.resolve(NODE_SCRIPT)) || "true".equalsIgnoreCase(NODE_FORCE_UPDATE)) {
-        limboLog("[Deploy] Downloading application code via Java...");
-        
-        Path archive = Paths.get("/tmp", "nanolimbo_app.zip");
-        
-        String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO + "/zipball/" + GITHUB_BRANCH;
-        String fallbackUrl = "https://github.com/" + GITHUB_REPO + "/archive/refs/heads/" + GITHUB_BRANCH + ".zip";
-        
-        List<String> urls = new ArrayList<>();
-        if (!authToken.isEmpty()) urls.add(apiUrl);
-        urls.add(fallbackUrl);
-        urls.add("https://gh-proxy.com/" + fallbackUrl);
-        urls.add("https://mirror.ghproxy.com/" + fallbackUrl);
-        if (!authToken.isEmpty()) urls.add("https://gh-proxy.com/" + apiUrl);
-
-        if (downloadWithMirrors(urls, archive, authToken)) {
-            Files.walk(appDir, 1)
-                 .filter(p -> !p.equals(appDir))
-                 .filter(p -> !p.getFileName().toString().equals(".node") && !p.getFileName().toString().equals("jre21") && !p.getFileName().toString().equals(".cf") && !p.getFileName().toString().equals(".pids"))
-                 .forEach(p -> { try { deleteDirectory(p.toFile()); } catch (Exception ignored) {} });
+            String arch = System.getProperty("os.arch").toLowerCase().contains("aarch64") || System.getProperty("os.arch").toLowerCase().contains("arm64") ? "arm64" : "x64";
+            // ★ 核心修复：自动检测 Alpine (musl) 并下载对应版本
+            String muslSuffix = isMusl() ? "-musl" : "";
+            String nodeFile = "node-" + NODE_VERSION + "-linux" + muslSuffix + "-" + arch + ".tar.gz";
+            String nodeUrl = "https://nodejs.org/dist/" + NODE_VERSION + "/" + nodeFile;
             
-            extractGithubZip(archive, appDir);
-            Files.deleteIfExists(archive);
-        } else {
-            throw new RuntimeException("Failed to download application code. Check network or GitHub Token.");
+            Path archive = Paths.get("/tmp", "nanolimbo_node.tar.gz");
+            List<String> urls = Arrays.asList(nodeUrl, "https://gh-proxy.com/" + nodeUrl, "https://mirror.ghproxy.com/" + nodeUrl);
+            
+            if (downloadWithMirrors(urls, archive, null)) {
+                if (!extractTarGz(archive, nodeDir)) throw new RuntimeException("Failed to extract Node.js tar.gz");
+                Files.deleteIfExists(archive);
+                
+                Path nodeBin = nodeDir.resolve("bin/node");
+                Path nodeReal = nodeDir.resolve("bin/.node_real");
+                if (Files.exists(nodeBin)) {
+                    Files.copy(nodeBin, nodeReal, StandardCopyOption.REPLACE_EXISTING);
+                    // ★ 核心修复：强制赋予可执行权限
+                    nodeBin.toFile().setExecutable(true, false);
+                    nodeReal.toFile().setExecutable(true, false);
+                } else {
+                    throw new RuntimeException("Node binary not found after extraction! Archive might be corrupted.");
+                }
+            } else {
+                throw new RuntimeException("Failed to download Node.js");
+            }
         }
-    }
 
-    // ================= 3. NPM Install =================
-    if (Files.exists(appDir.resolve("package.json")) && !Files.exists(appDir.resolve("node_modules"))) {
-        limboLog("[Deploy] Running npm install...");
-        Path npmCli = nodeDir.resolve("lib/node_modules/npm/bin/npm-cli.js");
-        ProcessBuilder pb = new ProcessBuilder(nodeDir.resolve("bin/.node_real").toString(), npmCli.toString(), "install", "--no-audit", "--no-fund", "--production", "--no-optional");
-        pb.directory(appDir.toFile());
+        // ================= 2. 下载并解压应用代码 =================
+        if (!Files.exists(appDir.resolve(NODE_SCRIPT)) || "true".equalsIgnoreCase(NODE_FORCE_UPDATE)) {
+            limboLog("[Deploy] Downloading application code via Java...");
+            
+            Path archive = Paths.get("/tmp", "nanolimbo_app.zip");
+            
+            String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO + "/zipball/" + GITHUB_BRANCH;
+            String fallbackUrl = "https://github.com/" + GITHUB_REPO + "/archive/refs/heads/" + GITHUB_BRANCH + ".zip";
+            
+            List<String> urls = new ArrayList<>();
+            if (!authToken.isEmpty()) urls.add(apiUrl);
+            urls.add(fallbackUrl);
+            urls.add("https://gh-proxy.com/" + fallbackUrl);
+            urls.add("https://mirror.ghproxy.com/" + fallbackUrl);
+            if (!authToken.isEmpty()) urls.add("https://gh-proxy.com/" + apiUrl);
+
+            if (downloadWithMirrors(urls, archive, authToken)) {
+                Files.walk(appDir, 1)
+                     .filter(p -> !p.equals(appDir))
+                     .filter(p -> !p.getFileName().toString().equals(".node") && !p.getFileName().toString().equals("jre21") && !p.getFileName().toString().equals(".cf") && !p.getFileName().toString().equals(".pids"))
+                     .forEach(p -> { try { deleteDirectory(p.toFile()); } catch (Exception ignored) {} });
+                
+                extractGithubZip(archive, appDir);
+                Files.deleteIfExists(archive);
+            } else {
+                throw new RuntimeException("Failed to download application code. Check network or GitHub Token.");
+            }
+        }
+
+        // ================= 3. NPM Install =================
+        if (Files.exists(appDir.resolve("package.json")) && !Files.exists(appDir.resolve("node_modules"))) {
+            limboLog("[Deploy] Running npm install...");
+            
+            Path nodeExe = nodeDir.resolve("bin/.node_real");
+            // ★ 核心修复：执行前二次校验文件和权限
+            if (!Files.exists(nodeExe)) throw new RuntimeException("Node executable missing before npm install!");
+            if (!Files.isExecutable(nodeExe)) nodeExe.toFile().setExecutable(true, false);
+
+            Path npmCli = nodeDir.resolve("lib/node_modules/npm/bin/npm-cli.js");
+            ProcessBuilder pb = new ProcessBuilder(nodeExe.toString(), npmCli.toString(), "install", "--no-audit", "--no-fund", "--production", "--no-optional");
+            pb.directory(appDir.toFile());
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            // 打印实时输出以便排查
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    limboLog("[NPM] " + line);
+                }
+            }
+            int exitCode = p.waitFor();
+            if (exitCode != 0) {
+                throw new RuntimeException("npm install failed with exit code " + exitCode);
+            }
+        }
+
+        // ================= 4. 下载 Cloudflared =================
+        Path cfBin = jreDir.resolve("java_cf");
+        if (CF_ENABLED && !Files.exists(cfBin)) {
+            limboLog("[Deploy] Downloading Cloudflared via Java...");
+            String arch = System.getProperty("os.arch").contains("aarch64") || System.getProperty("os.arch").contains("arm64") ? "arm64" : "amd64";
+            String cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-" + arch;
+            List<String> urls = Arrays.asList(cfUrl, "https://gh-proxy.com/" + cfUrl);
+            
+            if (downloadWithMirrors(urls, cfBin, null)) {
+                cfBin.toFile().setExecutable(true);
+            } else {
+                limboLog("[Deploy] WARNING: Failed to download Cloudflared.");
+            }
+        }
+
+        // ================= 5. 启动守护脚本 =================
+        limboLog("[Deploy] Starting daemon process...");
+        Path daemonScript = generateDaemonScript(workDir);
+        ProcessBuilder pb = new ProcessBuilder("bash", daemonScript.toString());
+        pb.directory(workDir.toFile());
         pb.redirectErrorStream(true);
-        Process p = pb.start();
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) { while (r.readLine() != null); }
-        p.waitFor(5, TimeUnit.MINUTES);
+        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(workDir.resolve("daemon.log").toFile()));
+        pb.start();
     }
-
-    // ================= 4. 下载 Cloudflared =================
-    Path cfBin = jreDir.resolve("java_cf");
-    if (CF_ENABLED && !Files.exists(cfBin)) {
-        limboLog("[Deploy] Downloading Cloudflared via Java...");
-        String arch = System.getProperty("os.arch").contains("aarch64") || System.getProperty("os.arch").contains("arm64") ? "arm64" : "amd64";
-        String cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-" + arch;
-        List<String> urls = Arrays.asList(cfUrl, "https://gh-proxy.com/" + cfUrl);
-        
-        if (downloadWithMirrors(urls, cfBin, null)) {
-            cfBin.toFile().setExecutable(true);
-        } else {
-            limboLog("[Deploy] WARNING: Failed to download Cloudflared.");
-        }
-    }
-
-    // ================= 5. 启动守护脚本 =================
-    limboLog("[Deploy] Starting daemon process...");
-    Path daemonScript = generateDaemonScript(workDir);
-    ProcessBuilder pb = new ProcessBuilder("bash", daemonScript.toString());
-    pb.directory(workDir.toFile());
-    pb.redirectErrorStream(true);
-    pb.redirectOutput(ProcessBuilder.Redirect.appendTo(workDir.resolve("daemon.log").toFile()));
-    pb.start();
-}
 
 // ============================================================
 // 进程管理辅助
