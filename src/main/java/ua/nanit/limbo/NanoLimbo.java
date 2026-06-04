@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -161,9 +162,10 @@ private static void extractGithubZip(Path zipFile, Path targetDir) throws IOExce
     }
 }
 
+// 【修复1】改为 --strip-components=2
 private static boolean extractTarGz(Path archive, Path targetDir) {
     try {
-        ProcessBuilder pb = new ProcessBuilder("tar", "-xzf", archive.toString(), "-C", targetDir.toString(), "--strip-components=1");
+        ProcessBuilder pb = new ProcessBuilder("tar", "-xzf", archive.toString(), "-C", targetDir.toString(), "--strip-components=2");
         pb.redirectErrorStream(true);
         Process p = pb.start();
         try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) { while (r.readLine() != null); }
@@ -339,18 +341,24 @@ public static void main(String[] args) {
             }
             Files.deleteIfExists(archive);
 
-            // 核心修复：确保 node 二进制存在并赋予权限
-            Path nodeBin = nodeDir.resolve("bin/node");
-            if (!Files.exists(nodeBin)) {
-                throw new RuntimeException("Node binary not found after extraction!");
+            //【修复2】全局自动查找node二进制，不再固定路径
+            Path nodeBin = null;
+            try(Stream<Path> walk = Files.walk(nodeDir)){
+                nodeBin = walk.filter(Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().equals("node"))
+                        .findFirst().orElse(null);
             }
-
-            // 复制为 .node_real 并强制赋予权限
+            if(nodeBin == null){
+                throw new RuntimeException("解压完成，但全局找不到node可执行文件");
+            }
+            // 确保bin文件夹存在
+            Files.createDirectories(nodeRealPath.getParent());
+            // 复制生成.node_real
             Files.copy(nodeBin, nodeRealPath, StandardCopyOption.REPLACE_EXISTING);
             nodeBin.toFile().setExecutable(true, false);
             nodeRealPath.toFile().setExecutable(true, false);
 
-            // 额外修复：创建软链接防止找不到
+            // 软链接兜底
             try {
                 Files.deleteIfExists(nodeDir.resolve("bin/node_real"));
                 Files.createSymbolicLink(nodeDir.resolve("bin/node_real"), nodeRealPath);
