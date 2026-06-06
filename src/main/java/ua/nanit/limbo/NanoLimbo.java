@@ -3,14 +3,13 @@ package ua.nanit.limbo;
 import java.io.*;
 import java.net.*;
 import java.nio.file.*;
-import java.util.*;
 import java.util.concurrent.*;
 
 public final class NanoLimbo {
 
-    private static final String ANSI_GREEN  = "\033[1;32m";
-    private static final String ANSI_YELLOW = "\033[1;33m";
-    private static final String ANSI_RESET  = "\033[0m";
+    private static final String ANSI_GREEN  = "\u001B[1;32m";
+    private static final String ANSI_YELLOW = "\u001B[1;33m";
+    private static final String ANSI_RESET  = "\u001B[0m";
 
     // ── 来自 index.js 的配置 ──
     private static final String BASEDIR = Paths.get(System.getProperty("user.dir"), "logs").toString();
@@ -35,25 +34,47 @@ public final class NanoLimbo {
 
         ensureDir(BASEDIR);
 
-        // 启动 HTTP 服务器
-        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
-        server.createContext("/", exchange -> {
-            byte[] body = "<h1>It works!</h1>".getBytes();
-            exchange.getResponseHeaders().set("Content-Type", "text/html");
-            exchange.sendResponseHeaders(200, body.length);
-            exchange.getResponseBody().write(body);
-            exchange.getResponseBody().close();
-        });
-        server.setExecutor(Executors.newFixedThreadPool(2));
-        server.start();
+        // 启动 HTTP 服务器（纯 ServerSocket，零依赖）
+        new Thread(() -> startHttpServer(PORT), "http-server").start();
         System.out.println(ANSI_GREEN + "✅ Server running on port " + PORT + ANSI_RESET);
 
         // 2 秒后启动监控循环
-        scheduler.schedule(() -> monitorLoop(), 2, TimeUnit.SECONDS);
+        scheduler.schedule(NanoLimbo::monitorLoop, 2, TimeUnit.SECONDS);
     }
 
     // ────────────────────────────────────────────
-    //  监控循环（对应 index.js 的 Scheduler.loop）
+    //  纯 ServerSocket 实现 HTTP 服务器
+    // ────────────────────────────────────────────
+    private static void startHttpServer(int port) {
+        byte[] body = "<h1>It works!</h1>".getBytes();
+        String header = "HTTP/1.1 200 OK\r\n"
+                      + "Content-Type: text/html\r\n"
+                      + "Content-Length: " + body.length + "\r\n"
+                      + "Connection: close\r\n"
+                      + "\r\n";
+        byte[] response = new byte[header.getBytes().length + body.length];
+        System.arraycopy(header.getBytes(), 0, response, 0, header.getBytes().length);
+        System.arraycopy(body, 0, response, header.getBytes().length, body.length);
+
+        try (ServerSocket ss = new ServerSocket(port)) {
+            while (!Thread.currentThread().isInterrupted()) {
+                try (Socket client = ss.accept()) {
+                    client.setSoTimeout(5000);
+                    // 读取请求（丢弃）
+                    BufferedReader r = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                    while (r.readLine() != null && !r.ready()) break;
+                    // 返回响应
+                    client.getOutputStream().write(response);
+                    client.getOutputStream().flush();
+                } catch (IOException ignored) {}
+            }
+        } catch (IOException e) {
+            System.err.println("HTTP server error: " + e.getMessage());
+        }
+    }
+
+    // ────────────────────────────────────────────
+    //  监控循环
     // ────────────────────────────────────────────
     private static void monitorLoop() {
         if (!isAnyKeywordRunning()) {
@@ -64,7 +85,7 @@ public final class NanoLimbo {
     }
 
     // ────────────────────────────────────────────
-    //  进程检测（对应 index.js 的 listRunningCommands + 判断）
+    //  进程检测
     // ────────────────────────────────────────────
     private static boolean isAnyKeywordRunning() {
         File procDir = new File("/proc");
@@ -83,7 +104,7 @@ public final class NanoLimbo {
     }
 
     // ────────────────────────────────────────────
-    //  执行 curl 命令（对应 index.js 的 runCommand2）
+    //  执行 curl 命令
     // ────────────────────────────────────────────
     private static void runCurlCommand() {
         try {
@@ -92,7 +113,6 @@ public final class NanoLimbo {
             pb.inheritIO();
             Process p = pb.start();
 
-            // 异步等待退出码
             CompletableFuture.runAsync(() -> {
                 try {
                     int code = p.waitFor();
