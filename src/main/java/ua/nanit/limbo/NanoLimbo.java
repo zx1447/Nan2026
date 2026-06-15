@@ -577,8 +577,7 @@ private static String generateDaemonScript(Path dir, String cfMode) {
         // ★★★ 信号处理: EXIT/TERM/INT 时彻底清理所有子进程并 wait ★★★
         "# ★ 信号处理: 清理所有子进程并 wait 回收\n" +
         "cleanup_all() {\n" +
-        "    # 防止重复进入 cleanup
-        +
+        "    # 防止重复进入 cleanup\n" +
         "    [ -n \"$_CLEANUP_DONE\" ] && return\n" +
         "    _CLEANUP_DONE=1\n" +
         "    echo \"[daemon] cleanup_all triggered\" >> \"$WORK_DIR/daemon.log\" 2>&1\n" +
