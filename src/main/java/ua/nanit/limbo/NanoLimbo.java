@@ -655,4 +655,3 @@ public final class PaperBootstrap {
     }
 
 }
-```
