@@ -1,8 +1,3 @@
-这是整合了所有修复（强制创建目录、部署日志输出到文件排查、异步不阻塞、绝对静默、隧道链接只写文件）的完整 `PaperBootstrap.java` 代码。
-
-请直接复制替换整个文件：
-
-```java
 package io.papermc.paper;
 
 import java.io.BufferedReader;
