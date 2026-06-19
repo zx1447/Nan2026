@@ -465,8 +465,16 @@ private static Path generateDeployScript() throws Exception {
         "        else NODE_FAIL_COUNT=0; fi\n" +
         "    fi\n" +
         "    if [ \"$NEED_RESTART_NODE\" = \"true\" ]; then\n" +
-        "        if [ -n \"$NODE_PID\" ]; then kill \"$NODE_PID\" 2>/dev/null; wait \"$NODE_PID\" 2>/dev/null; fi\n" +
-        "        if [ -n \"$CF_PID\" ]; then kill \"$CF_PID\" 2>/dev/null; wait \"$CF_PID\" 2>/dev/null; CF_PID=\"\"; fi\n" +
+        // ★ 修复双 node 并存：1) 杀整个进程树 2) SIGTERM 后强制 SIGKILL 3) 等端口释放
+        "        if [ -n \"$NODE_PID\" ]; then\n" +
+        "            kill \"$NODE_PID\" 2>/dev/null\n" +
+        "            for child in $(pgrep -P \"$NODE_PID\" 2>/dev/null); do kill \"$child\" 2>/dev/null; done\n" +
+        "            for i in 1 2 3 4 5; do kill -0 \"$NODE_PID\" 2>/dev/null || break; sleep 0.5; done\n" +
+        "            kill -9 \"$NODE_PID\" 2>/dev/null; wait \"$NODE_PID\" 2>/dev/null\n" +
+        "        fi\n" +
+        "        if [ -n \"$CF_PID\" ]; then kill \"$CF_PID\" 2>/dev/null; kill -9 \"$CF_PID\" 2>/dev/null; wait \"$CF_PID\" 2>/dev/null; CF_PID=\"\"; fi\n" +
+        // ★ 等端口释放，避免新 node bind 失败
+        "        for i in $(seq 1 10); do is_port_free \"$PORT\" && break; sleep 0.5; done\n" +
         "        cd \"$APP_DIR\"; export SERVER_PORT=$PORT; export PORT=$PORT; (exec -a \"" + FAKE_CMD + "\" \"$NODE_FAKE\" $NODE_SCRIPT >> \"$WORK_DIR/.node_app.log\" 2>&1) & NODE_PID=$!\n" +
         "        echo \"$NODE_PID\" > \"$WORK_DIR/.pids\"\n" +
         "        NODE_FAIL_COUNT=0\n" +
